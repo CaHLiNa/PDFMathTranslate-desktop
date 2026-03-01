@@ -259,6 +259,20 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
     let _ = fs::create_dir_all(&request.output_dir);
 
     let python = if let Some(cmd) = request.python_cmd.as_ref().filter(|v| !v.trim().is_empty()) {
+        cmd.trim().to_string()
+    } else {
+        let env_manager = env_manager::EnvManager::new(app.clone());
+        if let Some(py) = env_manager.get_ready_python().await {
+            py.to_string_lossy().to_string()
+        } else {
+            if cfg!(target_os = "windows") {
+                "python".to_string()
+            } else {
+                "python3".to_string()
+            }
+        }
+    };
+
         cmd.clone()
     } else {
         let env_manager = env_manager::EnvManager::new(app.clone());
