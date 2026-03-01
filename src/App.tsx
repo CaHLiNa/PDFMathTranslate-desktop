@@ -22,10 +22,12 @@ type ThemeId = "vscode-dark-plus" | "vscode-light-plus" | "vscode-high-contrast"
 type EnvStatus = 
   | { status: "NotInitialized" }
   | { status: "PythonMissing" }
-  | { status: "VenvCreating" }
-  | { status: "InstallingDependencies" }
-  | { status: "Ready" }
-  | { status: "Error", data: string };
+  | { status: "DownloadingPython", data: number }
+  | { status: "ExtractingPython" }
+| { status: "VenvCreating" }
+| { status: "InstallingDependencies" }
+| { status: "Ready" }
+| { status: "Error", data: string };
 
 interface EnvSetupProgress {
   message: string;
@@ -374,7 +376,7 @@ function EnvSetupOverlay({
           </div>
         )}
 
-        {(status.status === "VenvCreating" || status.status === "InstallingDependencies") ? (
+        {(status.status === "VenvCreating" || status.status === "InstallingDependencies" || status.status === "DownloadingPython" || status.status === "ExtractingPython") ? (
           <div className="env-progress-section">
             <div className="progress-bar-container">
               <div 
@@ -383,20 +385,16 @@ function EnvSetupOverlay({
               />
             </div>
             <p className="progress-message">{progress?.message ?? "正在初始化..."}</p>
-            <div className="env-logs-viewer">
-              {logs.map((log, i) => (
-                <div key={i} className="log-line">{log}</div>
-              ))}
-            </div>
+            {logs.length > 0 && (
+              <div className="env-logs-viewer">
+                {logs.map((log, i) => (
+                  <div key={i} className="log-line">{log}</div>
+                ))}
+              </div>
+            )}
           </div>
         ) : status.status !== "Error" && (
-          <div className="env-action-section">
-            <button className="primary-setup-btn" onClick={onStart}>
-              开始自动配置
-            </button>
-            <p className="env-note">这可能需要几分钟，取决于您的网络速度。</p>
-          </div>
-        )}
+
       </div>
     </div>
   );
