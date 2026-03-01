@@ -156,7 +156,15 @@ fn emit_task(app: &AppHandle, task_id: &str, task: TranslationTask, event: Optio
     let _ = app.emit("translation-progress", payload);
 }
 
-fn resolve_script_path() -> Option<PathBuf> {
+fn resolve_script_path(app: &AppHandle) -> Option<PathBuf> {
+    // 1. 尝试从 Tauri 资源目录获取 (用于打包后的环境)
+    if let Ok(resource_path) = app.path().resolve("scripts/translate_stream.py", tauri::path::BaseDirectory::Resource) {
+        if resource_path.exists() {
+            return Some(resource_path);
+        }
+    }
+
+    // 2. 尝试从当前工作目录获取 (用于开发环境)
     let cwd = std::env::current_dir().ok()?;
     let candidates = [
         cwd.join("scripts/translate_stream.py"),
@@ -166,6 +174,7 @@ fn resolve_script_path() -> Option<PathBuf> {
 
     candidates.into_iter().find(|path| path.exists())
 }
+
 
 fn fallback_output_paths(input_path: &str, output_dir: &str, lang_out: &str) -> (Option<String>, Option<String>) {
     let stem = Path::new(input_path)
@@ -246,7 +255,8 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
     };
     emit_task(&app, &task_id, task, None, None);
 
-    let Some(script_path) = resolve_script_path() else {
+    let Some(script_path) = resolve_script_path(&app) else {
+
         if let Some(task) = update_task(&state, &task_id, |task| {
             task.status = "failed".to_string();
             task.message = "未找到 scripts/translate_stream.py".to_string();
@@ -272,23 +282,6 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
             }
         }
     };
-
-        cmd.clone()
-    } else {
-        let env_manager = env_manager::EnvManager::new(app.clone());
-        if let Some(py) = env_manager.get_ready_python().await {
-            py.to_string_lossy().to_string()
-        } else {
-            if cfg!(target_os = "windows") {
-                "python".to_string()
-            } else {
-                "python3".to_string()
-            }
-        }
-    };
-
-
-
     let mut cmd = Command::new(python);
     cmd.arg(script_path)
         .arg("--input")
