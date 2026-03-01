@@ -35,14 +35,12 @@ impl EnvManager {
 
     pub fn get_python_executable(&self) -> PathBuf {
         let venv_path = self.get_venv_path();
-        let exe = if cfg!(target_os = "windows") {
+        if cfg!(target_os = "windows") {
             venv_path.join("Scripts").join("python.exe")
         } else {
             venv_path.join("bin").join("python")
-        };
-        exe
+        }
     }
-
 
     pub async fn get_ready_python(&self) -> Option<PathBuf> {
         // 1. 检查私有 venv
@@ -94,7 +92,6 @@ impl EnvManager {
         }
     }
 
-
     pub async fn setup(&self) -> Result<(), String> {
         let venv_path = self.get_venv_path();
         let config_dir = venv_path.parent().unwrap();
@@ -113,7 +110,6 @@ impl EnvManager {
         let mut venv_cmd = Command::new(py_cmd);
         venv_cmd.arg("-m").arg("venv").arg(&venv_path);
         
-        // Windows 下使用 --copies 增加稳定性，避免符号链接权限问题
         if cfg!(target_os = "windows") {
             venv_cmd.arg("--copies");
         }
@@ -122,13 +118,13 @@ impl EnvManager {
             .await
             .map_err(|e| format!("创建 venv 失败: {e}"))?;
 
-if !status.success() {
-return Err("创建 venv 失败，请检查 Python 是否支持 venv 模块。".to_string());
+        if !status.success() {
+            return Err("创建 venv 失败，请检查 Python 是否支持 venv 模块。".to_string());
         }
 
         let python_executable = self.get_python_executable();
 
-        // Windows 下特别处理：升级 pip 避免旧版本 SSL/路径问题
+        // Windows 下升级 pip
         if cfg!(target_os = "windows") {
             self.emit_progress("正在优化 pip 环境...", 45);
             let _ = Command::new(&python_executable)
@@ -153,17 +149,16 @@ return Err("创建 venv 失败，请检查 Python 是否支持 venv 模块。".t
             venv_path.join("bin").join("pip")
         };
 
-        // 获取系统环境变量，确保代理配置能传递（如果存在）
         let envs: std::collections::HashMap<String, String> = std::env::vars().collect();
 
         let mut child = Command::new(pip_path)
             .arg("install")
             .arg("pdf2zh-next")
             .arg("-i")
-            .arg("https://pypi.tuna.tsinghua.edu.cn/simple") // 强制使用国内镜像源
+            .arg("https://pypi.tuna.tsinghua.edu.cn/simple")
             .arg("--trusted-host")
-            .arg("pypi.tuna.tsinghua.edu.cn") // 解决 SSL 验证问题
-            .envs(envs) // 继承系统环境变量
+            .arg("pypi.tuna.tsinghua.edu.cn")
+            .envs(envs)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -173,7 +168,6 @@ return Err("创建 venv 失败，请检查 Python 是否支持 venv 模块。".t
         let mut reader = BufReader::new(stdout).lines();
 
         while let Ok(Some(line)) = reader.next_line().await {
-            // 将 pip 输出发送到前端供调试
             self.emit_log(&line);
         }
 
@@ -184,7 +178,7 @@ return Err("创建 venv 失败，请检查 Python 是否支持 venv 模块。".t
 
         self.emit_progress("环境配置完成！", 100);
         Ok(())
-
+    }
 
     fn emit_progress(&self, message: &str, progress: i32) {
         let _ = self.app_handle.emit("env-setup-progress", serde_json::json!({
