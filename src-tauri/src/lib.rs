@@ -156,7 +156,13 @@ where
     Some(task.clone())
 }
 
-fn emit_task(app: &AppHandle, task_id: &str, task: TranslationTask, event: Option<Value>, line: Option<String>) {
+fn emit_task(
+    app: &AppHandle,
+    task_id: &str,
+    task: TranslationTask,
+    event: Option<Value>,
+    line: Option<String>,
+) {
     let payload = TranslationProgressPayload {
         task_id: task_id.to_string(),
         task,
@@ -166,11 +172,24 @@ fn emit_task(app: &AppHandle, task_id: &str, task: TranslationTask, event: Optio
     let _ = app.emit("translation-progress", payload);
 }
 
+fn resource_script_candidates(resource_dir: &Path) -> [PathBuf; 3] {
+    [
+        resource_dir.join("scripts").join("translate_stream.py"),
+        resource_dir
+            .join("_up_")
+            .join("scripts")
+            .join("translate_stream.py"),
+        resource_dir.join("translate_stream.py"),
+    ]
+}
+
 fn resolve_script_path(app: &AppHandle) -> Option<PathBuf> {
     // 1. 尝试从 Tauri 资源目录获取 (用于打包后的环境)
-    if let Ok(resource_path) = app.path().resolve("scripts/translate_stream.py", tauri::path::BaseDirectory::Resource) {
-        if resource_path.exists() {
-            return Some(resource_path);
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        for candidate in resource_script_candidates(&resource_dir) {
+            if candidate.exists() {
+                return Some(candidate);
+            }
         }
     }
 
@@ -205,7 +224,8 @@ fn runtime_env_dirs(app: &AppHandle) -> (PathBuf, PathBuf, PathBuf) {
 
 fn apply_runtime_env(cmd: &mut Command, app: &AppHandle) {
     let (runtime_home, xdg_cache_home, tiktoken_cache_dir) = runtime_env_dirs(app);
-    let original_home = std::env::var("HOME").unwrap_or_else(|_| runtime_home.to_string_lossy().to_string());
+    let original_home =
+        std::env::var("HOME").unwrap_or_else(|_| runtime_home.to_string_lossy().to_string());
     cmd.env("HOME", &runtime_home)
         .env("XDG_CACHE_HOME", &xdg_cache_home)
         .env("TIKTOKEN_CACHE_DIR", &tiktoken_cache_dir)
@@ -213,8 +233,11 @@ fn apply_runtime_env(cmd: &mut Command, app: &AppHandle) {
         .env("PDFMT_ORIGINAL_HOME", original_home);
 }
 
-
-fn fallback_output_paths(input_path: &str, output_dir: &str, lang_out: &str) -> (Option<String>, Option<String>) {
+fn fallback_output_paths(
+    input_path: &str,
+    output_dir: &str,
+    lang_out: &str,
+) -> (Option<String>, Option<String>) {
     let stem = Path::new(input_path)
         .file_stem()
         .and_then(|v| v.to_str())
@@ -249,11 +272,7 @@ fn keep_output_inside_dir(path: Option<String>, output_dir: &str) -> Option<Stri
         return Some(source.to_string_lossy().to_string());
     }
 
-    if source
-        .parent()
-        .map(|p| p == out_dir)
-        .unwrap_or(false)
-    {
+    if source.parent().map(|p| p == out_dir).unwrap_or(false) {
         return Some(source.to_string_lossy().to_string());
     }
 
@@ -283,7 +302,12 @@ fn to_message(event: &Value) -> String {
         .to_string()
 }
 
-async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, request: TranslationRequest) {
+async fn run_translation_task(
+    app: AppHandle,
+    state: AppState,
+    task_id: String,
+    request: TranslationRequest,
+) {
     let Some(task) = update_task(&state, &task_id, |task| {
         task.status = "running".to_string();
         task.message = "启动翻译进程".to_string();
@@ -294,10 +318,9 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
     emit_task(&app, &task_id, task, None, None);
 
     let Some(script_path) = resolve_script_path(&app) else {
-
         if let Some(task) = update_task(&state, &task_id, |task| {
             task.status = "failed".to_string();
-            task.message = "未找到 scripts/translate_stream.py".to_string();
+            task.message = "未找到 translate_stream.py（已检查资源目录与开发目录）".to_string();
         }) {
             emit_task(&app, &task_id, task, None, None);
         }
@@ -312,7 +335,9 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
     } else {
         if let Some(task) = update_task(&state, &task_id, |task| {
             task.status = "failed".to_string();
-            task.message = "Python 环境未就绪（缺少 pdf2zh-next 或 idna）。请在界面中先执行环境自动配置。".to_string();
+            task.message =
+                "Python 环境未就绪（缺少 pdf2zh-next 或 idna）。请在界面中先执行环境自动配置。"
+                    .to_string();
         }) {
             emit_task(&app, &task_id, task, None, None);
         }
@@ -353,7 +378,8 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
         .as_ref()
         .filter(|v| !v.trim().is_empty())
     {
-        cmd.arg("--primary-font-family").arg(primary_font_family.trim());
+        cmd.arg("--primary-font-family")
+            .arg(primary_font_family.trim());
     }
     if let Some(use_alternating_pages_dual) = request.use_alternating_pages_dual {
         cmd.arg("--use-alternating-pages-dual")
@@ -445,71 +471,69 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
 
-                if let Some(task) = update_task(&state, &task_id, |task| {
-                    match event_type {
-                        "progress_start" | "progress_update" | "progress_end" => {
-                            task.progress = to_progress(&event).unwrap_or(task.progress);
-                            task.message = to_message(&event);
-                            task.status = "running".to_string();
-                        }
-                        "error" => {
-                            task.status = "failed".to_string();
-                            task.progress = task.progress.max(1.0);
-                            task.message = to_message(&event);
-                        }
-                        "finish" => {
-                            task.status = "completed".to_string();
-                            task.progress = 100.0;
-                            task.message = "翻译完成".to_string();
-
-                            if let Some(result) = event.get("translate_result") {
-                                task.mono_output = result
-                                    .get("mono_pdf_path")
-                                    .and_then(|v| v.as_str())
-                                    .map(|v| v.to_string())
-                                    .or_else(|| {
-                                        result
-                                            .get("no_watermark_mono_pdf_path")
-                                            .and_then(|v| v.as_str())
-                                            .map(|v| v.to_string())
-                                    });
-
-                                task.dual_output = result
-                                    .get("dual_pdf_path")
-                                    .and_then(|v| v.as_str())
-                                    .map(|v| v.to_string())
-                                    .or_else(|| {
-                                        result
-                                            .get("no_watermark_dual_pdf_path")
-                                            .and_then(|v| v.as_str())
-                                            .map(|v| v.to_string())
-                                    });
-                            }
-
-                            if task.mono_output.is_none() && task.dual_output.is_none() {
-                                let (mono, dual) = fallback_output_paths(
-                                    &request.input_path,
-                                    &request.output_dir,
-                                    &request.lang_out,
-                                );
-                                task.mono_output = mono;
-                                task.dual_output = dual;
-                            }
-
-                            let normalized_mono =
-                                keep_output_inside_dir(task.mono_output.clone(), &request.output_dir);
-                            let normalized_dual =
-                                keep_output_inside_dir(task.dual_output.clone(), &request.output_dir);
-
-                            if normalized_mono.is_some() {
-                                task.mono_output = normalized_mono;
-                            }
-                            if normalized_dual.is_some() {
-                                task.dual_output = normalized_dual;
-                            }
-                        }
-                        _ => {}
+                if let Some(task) = update_task(&state, &task_id, |task| match event_type {
+                    "progress_start" | "progress_update" | "progress_end" => {
+                        task.progress = to_progress(&event).unwrap_or(task.progress);
+                        task.message = to_message(&event);
+                        task.status = "running".to_string();
                     }
+                    "error" => {
+                        task.status = "failed".to_string();
+                        task.progress = task.progress.max(1.0);
+                        task.message = to_message(&event);
+                    }
+                    "finish" => {
+                        task.status = "completed".to_string();
+                        task.progress = 100.0;
+                        task.message = "翻译完成".to_string();
+
+                        if let Some(result) = event.get("translate_result") {
+                            task.mono_output = result
+                                .get("mono_pdf_path")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v.to_string())
+                                .or_else(|| {
+                                    result
+                                        .get("no_watermark_mono_pdf_path")
+                                        .and_then(|v| v.as_str())
+                                        .map(|v| v.to_string())
+                                });
+
+                            task.dual_output = result
+                                .get("dual_pdf_path")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v.to_string())
+                                .or_else(|| {
+                                    result
+                                        .get("no_watermark_dual_pdf_path")
+                                        .and_then(|v| v.as_str())
+                                        .map(|v| v.to_string())
+                                });
+                        }
+
+                        if task.mono_output.is_none() && task.dual_output.is_none() {
+                            let (mono, dual) = fallback_output_paths(
+                                &request.input_path,
+                                &request.output_dir,
+                                &request.lang_out,
+                            );
+                            task.mono_output = mono;
+                            task.dual_output = dual;
+                        }
+
+                        let normalized_mono =
+                            keep_output_inside_dir(task.mono_output.clone(), &request.output_dir);
+                        let normalized_dual =
+                            keep_output_inside_dir(task.dual_output.clone(), &request.output_dir);
+
+                        if normalized_mono.is_some() {
+                            task.mono_output = normalized_mono;
+                        }
+                        if normalized_dual.is_some() {
+                            task.dual_output = normalized_dual;
+                        }
+                    }
+                    _ => {}
                 }) {
                     if event_type == "finish" {
                         completed = true;
@@ -735,4 +759,29 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resource_script_candidates;
+    use std::path::Path;
+
+    #[test]
+    fn resource_script_candidates_cover_packaged_layouts() {
+        let resource_dir = Path::new("/tmp/resources");
+        let candidates = resource_script_candidates(resource_dir);
+
+        assert_eq!(
+            candidates[0],
+            resource_dir.join("scripts").join("translate_stream.py")
+        );
+        assert_eq!(
+            candidates[1],
+            resource_dir
+                .join("_up_")
+                .join("scripts")
+                .join("translate_stream.py")
+        );
+        assert_eq!(candidates[2], resource_dir.join("translate_stream.py"));
+    }
 }

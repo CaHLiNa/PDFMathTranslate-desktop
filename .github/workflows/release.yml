@@ -16,10 +16,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: "macos-latest" # 对于 M1/M2 (aarch64)
-            args: "--target aarch64-apple-darwin"
-          - platform: "macos-latest" # 对于 Intel Mac (x86_64)
-            args: "--target x86_64-apple-darwin"
+          - platform: "macos-latest" # 内部测试分发（M1/M2, aarch64）
+            args: "--target aarch64-apple-darwin --bundles app --no-sign"
+          - platform: "macos-latest" # 内部测试分发（Intel, x86_64）
+            args: "--target x86_64-apple-darwin --bundles app --no-sign"
           - platform: "windows-latest" # 对于 Windows Intel/AMD (x64)
             args: "--target x86_64-pc-windows-msvc"
 

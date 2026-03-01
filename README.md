@@ -52,3 +52,20 @@ npm run tauri dev
 - 找不到 `pdf2zh_next`：请在系统 Python 环境执行 `pip install pdf2zh-next`。
 - API 鉴权失败：检查 API Key 和 Base URL 是否正确。
 - 输出为空：先看任务日志，再检查 `output` 目录是否有 `*.mono.pdf` / `*.dual.pdf`。
+
+## 7. 内部测试分发（无 Apple 开发者签名）
+
+当前 CI 的 macOS 发布策略为**内部测试模式**：
+
+- 产物使用 `--bundles app --no-sign` 打包（不生成公证 DMG）。
+- 无需配置 Apple Developer 相关 secrets。
+
+下载并解压 macOS 产物后，首次运行前执行：
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/PDFMathTranslate Desktop.app"
+```
+
+然后右键应用选择 `Open`（首次），后续可直接双击启动。
+
+如果未来要面向普通用户公开分发，需要改回 `Developer ID` 签名 + Apple notarization。
