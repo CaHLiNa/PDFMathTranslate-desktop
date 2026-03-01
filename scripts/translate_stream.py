@@ -42,10 +42,12 @@ def build_engine_settings(args: argparse.Namespace) -> Any:
     engine = args.engine.strip().lower()
 
     if engine == "openai":
+        if not args.api_key:
+            raise ValueError("OpenAI 引擎需要配置 API Key")
         return OpenAISettings(
-            openai_api_key=args.api_key,
+            openai_api_key=args.api_key.strip(),
             openai_model=args.model or "gpt-4o-mini",
-            openai_base_url=args.base_url,
+            openai_base_url=args.base_url.strip() if args.base_url else None,
         )
 
     if engine == "google":
@@ -55,14 +57,16 @@ def build_engine_settings(args: argparse.Namespace) -> Any:
         return BingSettings()
 
     if engine == "deepseek":
+        if not args.api_key:
+            raise ValueError("DeepSeek 引擎需要配置 API Key")
         return DeepSeekSettings(
-            deepseek_api_key=args.api_key,
+            deepseek_api_key=args.api_key.strip(),
             deepseek_model=args.model or "deepseek-chat",
         )
 
     if engine == "ollama":
         return OllamaSettings(
-            ollama_host=args.base_url or "http://127.0.0.1:11434",
+            ollama_host=args.base_url.strip() if args.base_url else "http://127.0.0.1:11434",
             ollama_model=args.model or "gemma2",
         )
 
@@ -139,6 +143,9 @@ async def main() -> int:
     try:
         return await run()
     except Exception as exc:  # noqa: BLE001
+        import sys
+        print(f"Python Error: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         emit(
             {
                 "type": "error",
@@ -151,4 +158,5 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
+    import asyncio
     raise SystemExit(asyncio.run(main()))

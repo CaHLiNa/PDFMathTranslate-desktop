@@ -438,7 +438,8 @@ export default function App() {
   const [engineConfigs, setEngineConfigs] = useState<Record<string, EngineConnectionConfig>>(() =>
     buildInitialEngineConfigs(persisted, initialEngine),
   );
-  const [pythonCmd, setPythonCmd] = useState(persisted.pythonCmd ?? "python3");
+  const [pythonCmd, setPythonCmd] = useState(persisted.pythonCmd ?? "");
+
   const [queueLimit, setQueueLimit] = useState(
     Math.max(1, Math.min(Number(persisted.queueLimit ?? 2), 8)),
   );
@@ -534,6 +535,14 @@ export default function App() {
 
   const startTranslationForPath = useCallback(
     async (inputPath: string) => {
+      let cleanBaseUrl = activeEngineConfig.baseUrl.trim();
+      if (cleanBaseUrl && cleanBaseUrl.endsWith("/v1")) {
+        cleanBaseUrl = cleanBaseUrl.slice(0, -3);
+      }
+      if (cleanBaseUrl && cleanBaseUrl.endsWith("/v1/")) {
+        cleanBaseUrl = cleanBaseUrl.slice(0, -4);
+      }
+
       const request: TranslationRequest = {
         inputPath,
         outputDir: dirnameOf(inputPath),
@@ -541,10 +550,10 @@ export default function App() {
         langOut,
         engine,
         mode,
-        pythonCmd,
+        pythonCmd: pythonCmd.trim() || undefined,
         apiKey: activeEngineConfig.apiKey.trim() || undefined,
         model: activeEngineConfig.model.trim() || undefined,
-        baseUrl: activeEngineConfig.baseUrl.trim() || undefined,
+        baseUrl: cleanBaseUrl || undefined,
       };
 
       const task = await invoke<TranslationTask>("start_translation", { request });
