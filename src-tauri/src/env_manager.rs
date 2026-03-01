@@ -35,15 +35,14 @@ impl EnvManager {
 
     pub fn get_python_executable(&self) -> PathBuf {
         let venv_path = self.get_venv_path();
-        #[cfg(target_os = "windows")]
-        {
+        let exe = if cfg!(target_os = "windows") {
             venv_path.join("Scripts").join("python.exe")
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
+        } else {
             venv_path.join("bin").join("python")
-        }
+        };
+        exe
     }
+
 
     pub async fn get_ready_python(&self) -> Option<PathBuf> {
         // 1. 检查私有 venv
@@ -111,16 +110,39 @@ impl EnvManager {
 
         // 2. 创建虚拟环境
         self.emit_progress("正在创建虚拟环境 (venv)...", 30);
-        let status = Command::new(py_cmd)
-            .arg("-m")
-            .arg("venv")
-            .arg(&venv_path)
-            .status()
+        let mut venv_cmd = Command::new(py_cmd);
+        venv_cmd.arg("-m").arg("venv").arg(&venv_path);
+        
+        // Windows 下使用 --copies 增加稳定性，避免符号链接权限问题
+        if cfg!(target_os = "windows") {
+            venv_cmd.arg("--copies");
+        }
+
+        let status = venv_cmd.status()
             .await
             .map_err(|e| format!("创建 venv 失败: {e}"))?;
 
-        if !status.success() {
-            return Err("创建 venv 失败，请检查 Python 是否支持 venv 模块。".to_string());
+if !status.success() {
+return Err("创建 venv 失败，请检查 Python 是否支持 venv 模块。".to_string());
+        }
+
+        let python_executable = self.get_python_executable();
+
+        // Windows 下特别处理：升级 pip 避免旧版本 SSL/路径问题
+        if cfg!(target_os = "windows") {
+            self.emit_progress("正在优化 pip 环境...", 45);
+            let _ = Command::new(&python_executable)
+                .arg("-m")
+                .arg("pip")
+                .arg("install")
+                .arg("--upgrade")
+                .arg("pip")
+                .arg("-i")
+                .arg("https://pypi.tuna.tsinghua.edu.cn/simple")
+                .arg("--trusted-host")
+                .arg("pypi.tuna.tsinghua.edu.cn")
+                .status()
+                .await;
         }
 
         // 3. 安装依赖
@@ -139,26 +161,13 @@ impl EnvManager {
             .arg("pdf2zh-next")
             .arg("-i")
             .arg("https://pypi.tuna.tsinghua.edu.cn/simple") // 强制使用国内镜像源
-            .envs(envs) // 继承系统环境变量（包含可能的 PROXY 设置）
+            .arg("--trusted-host")
+            .arg("pypi.tuna.tsinghua.edu.cn") // 解决 SSL 验证问题
+            .envs(envs) // 继承系统环境变量
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("启动 pip 失败: {e}"))?;
-
-        self.emit_progress("正在安装 pdf2zh-next 及其依赖 (这可能需要几分钟)...", 60);
-        let pip_path = if cfg!(target_os = "windows") {
-            venv_path.join("Scripts").join("pip.exe")
-        } else {
-            venv_path.join("bin").join("pip")
-        };
-
-        let mut child = Command::new(pip_path)
-            .arg("install")
-            .arg("pdf2zh-next")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("启动 pip 失败: {e}"))?;
+            .map_err(|e| format!("启动 pip 失败 (路径: {}): {e}", venv_path.display()))?;
 
         let stdout = child.stdout.take().unwrap();
         let mut reader = BufReader::new(stdout).lines();
@@ -175,7 +184,7 @@ impl EnvManager {
 
         self.emit_progress("环境配置完成！", 100);
         Ok(())
-    }
+
 
     fn emit_progress(&self, message: &str, progress: i32) {
         let _ = self.app_handle.emit("env-setup-progress", serde_json::json!({
