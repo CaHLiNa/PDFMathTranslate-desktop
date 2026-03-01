@@ -27,7 +27,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model")
     parser.add_argument("--base-url")
     parser.add_argument("--qps", type=int, default=4)
+    import sys
+    print(f"DEBUG: Script received args: {sys.argv}", file=sys.stderr)
     return parser.parse_args()
+
 
 
 def build_engine_settings(args: argparse.Namespace) -> Any:

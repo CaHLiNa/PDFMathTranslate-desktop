@@ -282,8 +282,8 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
             }
         }
     };
-    let mut cmd = Command::new(python);
-    cmd.arg(script_path)
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script_path)
         .arg("--input")
         .arg(&request.input_path)
         .arg("--output")
@@ -300,14 +300,19 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
         .stderr(Stdio::piped());
 
     if let Some(api_key) = request.api_key.as_ref().filter(|v| !v.trim().is_empty()) {
-        cmd.arg("--api-key").arg(api_key);
+        cmd.arg("--api-key").arg(api_key.trim());
     }
     if let Some(model) = request.model.as_ref().filter(|v| !v.trim().is_empty()) {
-        cmd.arg("--model").arg(model);
+        cmd.arg("--model").arg(model.trim());
     }
     if let Some(base_url) = request.base_url.as_ref().filter(|v| !v.trim().is_empty()) {
-        cmd.arg("--base-url").arg(base_url);
+        cmd.arg("--base-url").arg(base_url.trim());
     }
+
+    println!("DEBUG: Executing translation command:");
+    println!("  Python: {}", python);
+    println!("  Script: {}", script_path.display());
+    println!("  Args: {:?}", cmd);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
