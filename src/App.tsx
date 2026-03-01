@@ -376,24 +376,32 @@ function EnvSetupOverlay({
           </div>
         )}
 
-        {(status.status === "VenvCreating" || status.status === "InstallingDependencies" || status.status === "DownloadingPython" || status.status === "ExtractingPython") ? (
-          <div className="env-progress-section">
-            <div className="progress-bar-container">
-              <div 
-                className="progress-bar-fill" 
-                style={{ width: `${progress?.progress ?? 0}%` }}
-              />
-            </div>
-            <p className="progress-message">{progress?.message ?? "正在初始化..."}</p>
-            {logs.length > 0 && (
-              <div className="env-logs-viewer">
-                {logs.map((log, i) => (
-                  <div key={i} className="log-line">{log}</div>
-                ))}
-              </div>
-            )}
+{(status.status === "VenvCreating" || status.status === "InstallingDependencies" || status.status === "DownloadingPython" || status.status === "ExtractingPython") ? (
+<div className="env-progress-section">
+<div className="progress-bar-container">
+<div
+className="progress-bar-fill"
+style={{ width: `${progress?.progress ?? 0}%` }}
+/>
+</div>
+<p className="progress-message">{progress?.message ?? "正在初始化..."}</p>
+{logs.length > 0 && (
+<div className="env-logs-viewer">
+{logs.map((log, i) => (
+<div key={i} className="log-line">{log}</div>
+))}
+</div>
+)}
           </div>
-        ) : status.status !== "Error" && (
+        ) : (status.status !== "Error" && (
+<div className="env-action-section">
+<button className="primary-setup-btn" onClick={onStart}>
+开始自动配置
+</button>
+<p className="env-note">这可能需要几分钟，取决于您的网络速度。</p>
+          </div>
+        )
+)}
 
       </div>
     </div>
