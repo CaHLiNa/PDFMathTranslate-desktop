@@ -21,7 +21,9 @@
     ],
     "security": {
       "csp": null,
-      "capabilities": ["default"]
+      "capabilities": [
+        "default"
+      ]
     }
   },
   "bundle": {
@@ -34,10 +36,5 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
-  }
-
-    "active": false,
-    "targets": "all",
-    "icon": ["icons/icon.png"]
   }
 }
