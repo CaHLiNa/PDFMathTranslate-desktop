@@ -535,14 +535,6 @@ export default function App() {
 
   const startTranslationForPath = useCallback(
     async (inputPath: string) => {
-      let cleanBaseUrl = activeEngineConfig.baseUrl.trim();
-      if (cleanBaseUrl && cleanBaseUrl.endsWith("/v1")) {
-        cleanBaseUrl = cleanBaseUrl.slice(0, -3);
-      }
-      if (cleanBaseUrl && cleanBaseUrl.endsWith("/v1/")) {
-        cleanBaseUrl = cleanBaseUrl.slice(0, -4);
-      }
-
       const request: TranslationRequest = {
         inputPath,
         outputDir: dirnameOf(inputPath),
@@ -553,8 +545,9 @@ export default function App() {
         pythonCmd: pythonCmd.trim() || undefined,
         apiKey: activeEngineConfig.apiKey.trim() || undefined,
         model: activeEngineConfig.model.trim() || undefined,
-        baseUrl: cleanBaseUrl || undefined,
+        baseUrl: activeEngineConfig.baseUrl.trim() || undefined,
       };
+
 
       const task = await invoke<TranslationTask>("start_translation", { request });
       setTasksById((prev) => ({
