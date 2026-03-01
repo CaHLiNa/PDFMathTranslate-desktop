@@ -124,6 +124,27 @@ impl EnvManager {
         }
 
         // 3. 安装依赖
+        self.emit_progress("正在安装 pdf2zh-next 及其依赖 (使用清华镜像源加速)...", 60);
+        let pip_path = if cfg!(target_os = "windows") {
+            venv_path.join("Scripts").join("pip.exe")
+        } else {
+            venv_path.join("bin").join("pip")
+        };
+
+        // 获取系统环境变量，确保代理配置能传递（如果存在）
+        let envs: std::collections::HashMap<String, String> = std::env::vars().collect();
+
+        let mut child = Command::new(pip_path)
+            .arg("install")
+            .arg("pdf2zh-next")
+            .arg("-i")
+            .arg("https://pypi.tuna.tsinghua.edu.cn/simple") // 强制使用国内镜像源
+            .envs(envs) // 继承系统环境变量（包含可能的 PROXY 设置）
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("启动 pip 失败: {e}"))?;
+
         self.emit_progress("正在安装 pdf2zh-next 及其依赖 (这可能需要几分钟)...", 60);
         let pip_path = if cfg!(target_os = "windows") {
             venv_path.join("Scripts").join("pip.exe")
