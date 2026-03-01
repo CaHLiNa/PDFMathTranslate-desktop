@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.vscode/
+.DS_Store
+src-tauri/target/
+pdf2zh_files/
+.venv/
+*.log
+.env
+src-tauri/gen/
+
+dist/
+.vscode/
+.DS_Store
+src-tauri/target/
+pdf2zh_files/
