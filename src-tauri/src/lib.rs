@@ -50,8 +50,18 @@ struct TranslationRequest {
     api_key: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
+    qps: Option<u32>,
+    primary_font_family: Option<String>,
+    use_alternating_pages_dual: Option<bool>,
+    ocr_workaround: Option<bool>,
+    auto_enable_ocr_workaround: Option<bool>,
+    no_watermark_mode: Option<bool>,
+    save_auto_extracted_glossary: Option<bool>,
+    no_auto_extract_glossary: Option<bool>,
+    enhance_compatibility: Option<bool>,
+    translate_table_text: Option<bool>,
+    only_include_translated_page: Option<bool>,
     mode: String,
-    python_cmd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -175,6 +185,34 @@ fn resolve_script_path(app: &AppHandle) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.exists())
 }
 
+fn runtime_env_dirs(app: &AppHandle) -> (PathBuf, PathBuf, PathBuf) {
+    let base_dir = app
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let runtime_home = base_dir.join("runtime_home");
+    let xdg_cache_home = runtime_home.join(".cache");
+    let tiktoken_cache_dir = xdg_cache_home.join("tiktoken");
+    let babeldoc_cache_dir = xdg_cache_home.join("babeldoc");
+
+    let _ = fs::create_dir_all(&runtime_home);
+    let _ = fs::create_dir_all(&xdg_cache_home);
+    let _ = fs::create_dir_all(&tiktoken_cache_dir);
+    let _ = fs::create_dir_all(&babeldoc_cache_dir);
+
+    (runtime_home, xdg_cache_home, tiktoken_cache_dir)
+}
+
+fn apply_runtime_env(cmd: &mut Command, app: &AppHandle) {
+    let (runtime_home, xdg_cache_home, tiktoken_cache_dir) = runtime_env_dirs(app);
+    let original_home = std::env::var("HOME").unwrap_or_else(|_| runtime_home.to_string_lossy().to_string());
+    cmd.env("HOME", &runtime_home)
+        .env("XDG_CACHE_HOME", &xdg_cache_home)
+        .env("TIKTOKEN_CACHE_DIR", &tiktoken_cache_dir)
+        .env("USERPROFILE", &runtime_home)
+        .env("PDFMT_ORIGINAL_HOME", original_home);
+}
+
 
 fn fallback_output_paths(input_path: &str, output_dir: &str, lang_out: &str) -> (Option<String>, Option<String>) {
     let stem = Path::new(input_path)
@@ -268,21 +306,20 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
 
     let _ = fs::create_dir_all(&request.output_dir);
 
-    let python = if let Some(cmd) = request.python_cmd.as_ref().filter(|v| !v.trim().is_empty()) {
-        cmd.trim().to_string()
+    let env_manager = env_manager::EnvManager::new(app.clone());
+    let python = if let Some(py) = env_manager.get_ready_python().await {
+        py.to_string_lossy().to_string()
     } else {
-        let env_manager = env_manager::EnvManager::new(app.clone());
-        if let Some(py) = env_manager.get_ready_python().await {
-            py.to_string_lossy().to_string()
-        } else {
-            if cfg!(target_os = "windows") {
-                "python".to_string()
-            } else {
-                "python3".to_string()
-            }
+        if let Some(task) = update_task(&state, &task_id, |task| {
+            task.status = "failed".to_string();
+            task.message = "Python 环境未就绪（缺少 pdf2zh-next 或 idna）。请在界面中先执行环境自动配置。".to_string();
+        }) {
+            emit_task(&app, &task_id, task, None, None);
         }
+        return;
     };
     let mut cmd = Command::new(&python);
+    apply_runtime_env(&mut cmd, &app);
     cmd.arg(&script_path)
         .arg("--input")
         .arg(&request.input_path)
@@ -307,6 +344,51 @@ async fn run_translation_task(app: AppHandle, state: AppState, task_id: String, 
     }
     if let Some(base_url) = request.base_url.as_ref().filter(|v| !v.trim().is_empty()) {
         cmd.arg("--base-url").arg(base_url.trim());
+    }
+    if let Some(qps) = request.qps.filter(|v| *v > 0) {
+        cmd.arg("--qps").arg(qps.to_string());
+    }
+    if let Some(primary_font_family) = request
+        .primary_font_family
+        .as_ref()
+        .filter(|v| !v.trim().is_empty())
+    {
+        cmd.arg("--primary-font-family").arg(primary_font_family.trim());
+    }
+    if let Some(use_alternating_pages_dual) = request.use_alternating_pages_dual {
+        cmd.arg("--use-alternating-pages-dual")
+            .arg(use_alternating_pages_dual.to_string());
+    }
+    if let Some(ocr_workaround) = request.ocr_workaround {
+        cmd.arg("--ocr-workaround").arg(ocr_workaround.to_string());
+    }
+    if let Some(auto_enable_ocr_workaround) = request.auto_enable_ocr_workaround {
+        cmd.arg("--auto-enable-ocr-workaround")
+            .arg(auto_enable_ocr_workaround.to_string());
+    }
+    if let Some(no_watermark_mode) = request.no_watermark_mode {
+        cmd.arg("--no-watermark-mode")
+            .arg(no_watermark_mode.to_string());
+    }
+    if let Some(save_auto_extracted_glossary) = request.save_auto_extracted_glossary {
+        cmd.arg("--save-auto-extracted-glossary")
+            .arg(save_auto_extracted_glossary.to_string());
+    }
+    if let Some(no_auto_extract_glossary) = request.no_auto_extract_glossary {
+        cmd.arg("--no-auto-extract-glossary")
+            .arg(no_auto_extract_glossary.to_string());
+    }
+    if let Some(enhance_compatibility) = request.enhance_compatibility {
+        cmd.arg("--enhance-compatibility")
+            .arg(enhance_compatibility.to_string());
+    }
+    if let Some(translate_table_text) = request.translate_table_text {
+        cmd.arg("--translate-table-text")
+            .arg(translate_table_text.to_string());
+    }
+    if let Some(only_include_translated_page) = request.only_include_translated_page {
+        cmd.arg("--only-include-translated-page")
+            .arg(only_include_translated_page.to_string());
     }
 
     println!("DEBUG: Executing translation command:");

@@ -33,8 +33,18 @@ export interface TranslationRequest {
   apiKey?: string;
   model?: string;
   baseUrl?: string;
+  qps?: number;
+  primaryFontFamily?: string;
+  useAlternatingPagesDual?: boolean;
+  ocrWorkaround?: boolean;
+  autoEnableOcrWorkaround?: boolean;
+  noWatermarkMode?: boolean;
+  saveAutoExtractedGlossary?: boolean;
+  noAutoExtractGlossary?: boolean;
+  enhanceCompatibility?: boolean;
+  translateTableText?: boolean;
+  onlyIncludeTranslatedPage?: boolean;
   mode: "mono" | "dual" | "both";
-  pythonCmd?: string;
 }
 
 export interface TranslationProgressPayload {

@@ -47,6 +47,24 @@ impl EnvManager {
         self.get_base_dir().join("python_runtime")
     }
 
+    fn get_runtime_home_dir(&self) -> PathBuf {
+        self.get_base_dir().join("runtime_home")
+    }
+
+    fn prepare_runtime_env(&self) -> (PathBuf, PathBuf, PathBuf) {
+        let runtime_home = self.get_runtime_home_dir();
+        let xdg_cache_home = runtime_home.join(".cache");
+        let tiktoken_cache_dir = xdg_cache_home.join("tiktoken");
+        let babeldoc_cache_dir = xdg_cache_home.join("babeldoc");
+
+        let _ = fs::create_dir_all(&runtime_home);
+        let _ = fs::create_dir_all(&xdg_cache_home);
+        let _ = fs::create_dir_all(&tiktoken_cache_dir);
+        let _ = fs::create_dir_all(&babeldoc_cache_dir);
+
+        (runtime_home, xdg_cache_home, tiktoken_cache_dir)
+    }
+
     pub fn get_python_executable(&self) -> PathBuf {
         let venv_path = self.get_venv_path();
         
@@ -107,9 +125,16 @@ impl EnvManager {
     }
 
     async fn check_python_module(&self, python_path: &Path) -> bool {
+        let (runtime_home, xdg_cache_home, tiktoken_cache_dir) = self.prepare_runtime_env();
+        let original_home = std::env::var("HOME").unwrap_or_else(|_| runtime_home.to_string_lossy().to_string());
         let output = Command::new(python_path)
+            .env("HOME", &runtime_home)
+            .env("XDG_CACHE_HOME", &xdg_cache_home)
+            .env("TIKTOKEN_CACHE_DIR", &tiktoken_cache_dir)
+            .env("USERPROFILE", &runtime_home)
+            .env("PDFMT_ORIGINAL_HOME", &original_home)
             .arg("-c")
-            .arg("import pdf2zh_next; print('ok')")
+            .arg("import importlib; importlib.import_module('pdf2zh_next'); print('ok')")
             .status()
             .await;
 
@@ -215,14 +240,22 @@ impl EnvManager {
         }
 
         let python_executable = self.get_python_executable();
+        let (runtime_home, xdg_cache_home, tiktoken_cache_dir) = self.prepare_runtime_env();
+        let original_home = std::env::var("HOME").unwrap_or_else(|_| runtime_home.to_string_lossy().to_string());
 
         // 3. 安装依赖
         self.emit_progress("正在安装核心依赖 (pdf2zh-next)...", 80);
         let mut child = Command::new(&python_executable)
+            .env("HOME", &runtime_home)
+            .env("XDG_CACHE_HOME", &xdg_cache_home)
+            .env("TIKTOKEN_CACHE_DIR", &tiktoken_cache_dir)
+            .env("USERPROFILE", &runtime_home)
+            .env("PDFMT_ORIGINAL_HOME", &original_home)
             .arg("-m")
             .arg("pip")
             .arg("install")
             .arg("pdf2zh-next")
+            .arg("idna")
             .arg("-i")
             .arg("https://pypi.tuna.tsinghua.edu.cn/simple")
             .arg("--trusted-host")

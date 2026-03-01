@@ -5,14 +5,51 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
+import os
+import platform
+import subprocess
+import sys
+import tempfile
 import traceback
 from pathlib import Path
 from typing import Any
 
 
+ENGINE_ALIASES: dict[str, str] = {
+    "openai": "openai",
+    "gpt": "openai",
+    "gemini": "gemini",
+    "google": "gemini",
+    "deepseek": "deepseek",
+    "kimi": "kimi",
+    "moonshot": "kimi",
+    "zhipu": "zhipu",
+    "智普": "zhipu",
+    "glm": "zhipu",
+}
+
+SUPPORTED_ENGINES = ("openai", "gemini", "deepseek", "kimi", "zhipu")
+MIN_QPS = 1
+MAX_QPS = 32
+
+
 def emit(event: dict[str, Any]) -> None:
     print(json.dumps(event, ensure_ascii=False), flush=True)
+
+
+def parse_bool(value: str | bool | None) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,70 +63,248 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-key")
     parser.add_argument("--model")
     parser.add_argument("--base-url")
-    parser.add_argument("--qps", type=int, default=4)
-    import sys
+    parser.add_argument("--qps", type=int, default=8)
+    parser.add_argument("--primary-font-family")
+    parser.add_argument("--use-alternating-pages-dual", type=parse_bool)
+    parser.add_argument("--ocr-workaround", type=parse_bool)
+    parser.add_argument("--auto-enable-ocr-workaround", type=parse_bool)
+    parser.add_argument("--no-watermark-mode", type=parse_bool)
+    parser.add_argument("--save-auto-extracted-glossary", type=parse_bool)
+    parser.add_argument("--no-auto-extract-glossary", type=parse_bool)
+    parser.add_argument("--enhance-compatibility", type=parse_bool)
+    parser.add_argument("--translate-table-text", type=parse_bool)
+    parser.add_argument("--only-include-translated-page", type=parse_bool)
     print(f"DEBUG: Script received args: {sys.argv}", file=sys.stderr)
     return parser.parse_args()
 
 
+def clean(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped if stripped else None
+
+
+def normalize_engine_name(engine: str | None) -> str:
+    raw = (engine or "").strip()
+    if not raw:
+        return "openai"
+    return ENGINE_ALIASES.get(raw, ENGINE_ALIASES.get(raw.lower(), raw.lower()))
+
+
+def _can_use_as_home(home_dir: Path) -> bool:
+    try:
+        cache_dir = home_dir / ".cache" / "babeldoc"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        probe = cache_dir / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _guess_user_site_from_home(home_dir: Path) -> Path:
+    major, minor = sys.version_info[:2]
+    system = platform.system().lower()
+    if system == "darwin":
+        return (
+            home_dir
+            / "Library"
+            / "Python"
+            / f"{major}.{minor}"
+            / "lib"
+            / "python"
+            / "site-packages"
+        )
+    if system == "windows":
+        return (
+            home_dir
+            / "AppData"
+            / "Roaming"
+            / "Python"
+            / f"Python{major}{minor}"
+            / "site-packages"
+        )
+    return home_dir / ".local" / "lib" / f"python{major}.{minor}" / "site-packages"
+
+
+def _add_user_site_path(path: Path) -> None:
+    if not path.exists() or not path.is_dir():
+        return
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.append(path_str)
+    current_pythonpath = os.environ.get("PYTHONPATH", "")
+    pythonpath_items = [item for item in current_pythonpath.split(os.pathsep) if item]
+    if path_str not in pythonpath_items:
+        pythonpath_items.append(path_str)
+        os.environ["PYTHONPATH"] = os.pathsep.join(pythonpath_items)
+
+
+def prepare_runtime_environment() -> Path:
+    current_home_raw = os.environ.get("HOME")
+    current_home = Path(current_home_raw).expanduser() if current_home_raw else Path.home()
+    original_home_raw = os.environ.get("PDFMT_ORIGINAL_HOME") or current_home_raw
+    original_home = Path(original_home_raw).expanduser() if original_home_raw else current_home
+    original_user_site = _guess_user_site_from_home(original_home)
+
+    if _can_use_as_home(current_home):
+        _add_user_site_path(original_user_site)
+        return current_home
+
+    runtime_home = Path(tempfile.gettempdir()) / "pdfmathtranslate-home"
+    runtime_home.mkdir(parents=True, exist_ok=True)
+    (runtime_home / ".cache").mkdir(parents=True, exist_ok=True)
+    (runtime_home / ".cache" / "tiktoken").mkdir(parents=True, exist_ok=True)
+
+    os.environ["HOME"] = str(runtime_home)
+    os.environ["XDG_CACHE_HOME"] = str(runtime_home / ".cache")
+    os.environ["TIKTOKEN_CACHE_DIR"] = str(runtime_home / ".cache" / "tiktoken")
+    os.environ["USERPROFILE"] = str(runtime_home)
+    os.environ.setdefault("PDFMT_ORIGINAL_HOME", str(original_home))
+    _add_user_site_path(original_user_site)
+
+    print(f"DEBUG: Runtime HOME redirected to: {runtime_home}", file=sys.stderr)
+    print(f"DEBUG: Preserved user site-packages: {original_user_site}", file=sys.stderr)
+    return runtime_home
+
+
+def ensure_required_modules() -> None:
+    required = ("idna",)
+    missing: list[str] = []
+    for name in required:
+        try:
+            importlib.import_module(name)
+        except ModuleNotFoundError:
+            missing.append(name)
+
+    if not missing:
+        return
+
+    joined = " ".join(missing)
+    print(
+        f"DEBUG: Missing modules detected: {missing}, trying auto-install via pip",
+        file=sys.stderr,
+    )
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ModuleNotFoundError(
+            f"缺少 Python 依赖: {', '.join(missing)}。自动安装失败：{exc}。请运行 `{sys.executable} -m pip install {joined}`"
+        ) from exc
+
+    # Re-check after install.
+    still_missing: list[str] = []
+    for name in missing:
+        try:
+            importlib.import_module(name)
+        except ModuleNotFoundError:
+            still_missing.append(name)
+    if still_missing:
+        raise ModuleNotFoundError(
+            f"缺少 Python 依赖: {', '.join(still_missing)}。请运行 `{sys.executable} -m pip install {' '.join(still_missing)}`"
+        )
+
 
 def build_engine_settings(args: argparse.Namespace) -> Any:
     from pdf2zh_next import (
-        BingSettings,
         DeepSeekSettings,
-        GoogleSettings,
-        OllamaSettings,
+        GeminiSettings,
         OpenAISettings,
+        ZhipuSettings,
     )
+    engine_raw = args.engine
+    engine = normalize_engine_name(engine_raw)
+    api_key = clean(args.api_key)
+    model = clean(args.model)
+    base_url = clean(args.base_url)
 
     # 调试日志：打印关键配置（脱敏）
-    import sys
-    print(f"DEBUG: Engine selected: {engine}", file=sys.stderr)
-    print(f"DEBUG: Model: {args.model}", file=sys.stderr)
-    print(f"DEBUG: Base URL: {args.base_url}", file=sys.stderr)
-    if args.api_key:
-        masked_key = f"{args.api_key[:4]}****{args.api_key[-4:]}"
+    print(f"DEBUG: Engine selected(raw): {engine_raw}", file=sys.stderr)
+    print(f"DEBUG: Engine selected(normalized): {engine}", file=sys.stderr)
+    print(f"DEBUG: Model: {model}", file=sys.stderr)
+    print(f"DEBUG: Base URL: {base_url}", file=sys.stderr)
+    if api_key:
+        if len(api_key) >= 8:
+            masked_key = f"{api_key[:4]}****{api_key[-4:]}"
+        else:
+            masked_key = f"{api_key[:2]}****"
         print(f"DEBUG: API Key: {masked_key}", file=sys.stderr)
 
     if engine == "openai":
-        if not args.api_key:
+        if not api_key:
             raise ValueError("OpenAI 引擎需要配置 API Key")
         return OpenAISettings(
-            openai_api_key=args.api_key.strip(),
-            openai_model=args.model or "gpt-4o-mini",
-            openai_base_url=args.base_url.strip() if args.base_url else None,
+            openai_api_key=api_key,
+            openai_model=model or "gpt-4o-mini",
+            openai_base_url=base_url,
         )
 
-    if engine == "google":
-        return GoogleSettings()
-
-    if engine == "bing":
-        return BingSettings()
-
     if engine == "deepseek":
-        if not args.api_key:
+        if not api_key:
             raise ValueError("DeepSeek 引擎需要配置 API Key")
-        
-        # 如果用户选了 DeepSeek 但填了自定义 URL，尝试用 OpenAI 路径兼容它
-        if args.base_url and args.base_url.strip():
+
+        if base_url:
             print("DEBUG: Using OpenAI path for DeepSeek with custom Base URL", file=sys.stderr)
             return OpenAISettings(
-                openai_api_key=args.api_key.strip(),
-                openai_model=args.model or "deepseek-chat",
-                openai_base_url=args.base_url.strip(),
+                openai_api_key=api_key,
+                openai_model=model or "deepseek-chat",
+                openai_base_url=base_url,
             )
 
         return DeepSeekSettings(
-            deepseek_api_key=args.api_key.strip(),
-            deepseek_model=args.model or "deepseek-chat",
+            deepseek_api_key=api_key,
+            deepseek_model=model or "deepseek-chat",
         )
 
-    if engine == "ollama":
-        return OllamaSettings(
-            ollama_host=args.base_url.strip() if args.base_url else "http://127.0.0.1:11434",
-            ollama_model=args.model or "gemma2",
+    if engine == "gemini":
+        if not api_key:
+            raise ValueError("Gemini 引擎需要配置 API Key")
+
+        if base_url:
+            print("DEBUG: Using OpenAI path for Gemini with custom Base URL", file=sys.stderr)
+            return OpenAISettings(
+                openai_api_key=api_key,
+                openai_model=model or "gemini-1.5-flash",
+                openai_base_url=base_url,
+            )
+
+        return GeminiSettings(
+            gemini_api_key=api_key,
+            gemini_model=model or "gemini-1.5-flash",
         )
 
+    if engine == "zhipu":
+        if not api_key:
+            raise ValueError("智普引擎需要配置 API Key")
+
+        if base_url:
+            print("DEBUG: Using OpenAI path for Zhipu with custom Base URL", file=sys.stderr)
+            return OpenAISettings(
+                openai_api_key=api_key,
+                openai_model=model or "glm-4-flash",
+                openai_base_url=base_url,
+            )
+
+        return ZhipuSettings(
+            zhipu_api_key=api_key,
+            zhipu_model=model or "glm-4-flash",
+        )
+
+    if engine == "kimi":
+        if not api_key:
+            raise ValueError("Kimi 引擎需要配置 API Key")
+        return OpenAISettings(
+            openai_api_key=api_key,
+            openai_model=model or "moonshot-v1-8k",
+            openai_base_url=base_url or "https://api.moonshot.cn/v1",
+        )
+
+    supported = ", ".join(SUPPORTED_ENGINES)
+    raise ValueError(
+        f"不支持的引擎: {engine_raw!r} (normalized={engine!r})。支持: {supported}"
+    )
 
 
 def serialize_translate_result(result: Any) -> dict[str, Any]:
@@ -114,6 +329,13 @@ def serialize_event(event: dict[str, Any]) -> dict[str, Any]:
 
 
 async def run() -> int:
+    args = parse_args()
+    input_path = Path(args.input).expanduser().resolve()
+    output_dir = Path(args.output).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prepare_runtime_environment()
+    ensure_required_modules()
+
     from pdf2zh_next import (
         BasicSettings,
         PDFSettings,
@@ -121,11 +343,6 @@ async def run() -> int:
         TranslationSettings,
         do_translate_async_stream,
     )
-
-    args = parse_args()
-    input_path = Path(args.input).expanduser().resolve()
-    output_dir = Path(args.output).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     if not input_path.exists():
         emit({
@@ -137,18 +354,47 @@ async def run() -> int:
 
     engine_settings = build_engine_settings(args)
 
+    translation_kwargs: dict[str, Any] = {
+        "lang_in": args.lang_in,
+        "lang_out": args.lang_out,
+        "output": str(output_dir),
+        "qps": max(MIN_QPS, min(args.qps, MAX_QPS)),
+    }
+    if args.primary_font_family:
+        font_family = args.primary_font_family.strip().lower()
+        if font_family and font_family != "auto":
+            translation_kwargs["primary_font_family"] = font_family
+    if args.save_auto_extracted_glossary is not None:
+        translation_kwargs["save_auto_extracted_glossary"] = args.save_auto_extracted_glossary
+    if args.no_auto_extract_glossary is not None:
+        translation_kwargs["no_auto_extract_glossary"] = args.no_auto_extract_glossary
+
+    final_no_dual = args.mode == "mono"
+    final_no_mono = args.mode == "dual"
+
+    pdf_kwargs: dict[str, Any] = {
+        "no_dual": final_no_dual,
+        "no_mono": final_no_mono,
+    }
+    if args.use_alternating_pages_dual is not None:
+        pdf_kwargs["use_alternating_pages_dual"] = args.use_alternating_pages_dual
+    if args.enhance_compatibility is not None:
+        pdf_kwargs["enhance_compatibility"] = args.enhance_compatibility
+    if args.translate_table_text is not None:
+        pdf_kwargs["translate_table_text"] = args.translate_table_text
+    if args.ocr_workaround is not None:
+        pdf_kwargs["ocr_workaround"] = args.ocr_workaround
+    if args.auto_enable_ocr_workaround is not None:
+        pdf_kwargs["auto_enable_ocr_workaround"] = args.auto_enable_ocr_workaround
+    if args.only_include_translated_page is not None:
+        pdf_kwargs["only_include_translated_page"] = args.only_include_translated_page
+    if args.no_watermark_mode is not None:
+        pdf_kwargs["watermark_output_mode"] = "no_watermark" if args.no_watermark_mode else "watermarked"
+
     settings = SettingsModel(
         basic=BasicSettings(input_files={str(input_path)}),
-        translation=TranslationSettings(
-            lang_in=args.lang_in,
-            lang_out=args.lang_out,
-            output=str(output_dir),
-            qps=max(args.qps, 1),
-        ),
-        pdf=PDFSettings(
-            no_dual=args.mode == "mono",
-            no_mono=args.mode == "dual",
-        ),
+        translation=TranslationSettings(**translation_kwargs),
+        pdf=PDFSettings(**pdf_kwargs),
         translate_engine_settings=engine_settings,
     )
 

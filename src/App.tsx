@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { setTheme as setAppTheme } from "@tauri-apps/api/app";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import FileTree from "./components/FileTree";
 import PdfCanvasView, { type ScrollSyncState } from "./components/PdfCanvasView";
@@ -13,11 +14,16 @@ import type {
 } from "./types";
 
 type PanelId = "left" | "right";
-type SidebarView = "explorer" | "translate" | "tasks";
+type SidebarView = "explorer" | "translate" | "llm" | "tasks";
 type PreviewLayout = "source" | "translated" | "compare";
 type LangOption = { value: string; label: string };
+type FontFamilyOption = "auto" | "serif" | "sans-serif" | "script";
+type DualDisplayModeOption = "left-right" | "alternating-pages";
 type EngineConnectionConfig = { apiKey: string; model: string; baseUrl: string };
+type EngineExtraParam = { key: string; value: string };
+type EngineId = "OpenAI" | "Gemini" | "DeepSeek" | "Kimi" | "Zhipu";
 type ThemeId = "vscode-dark-plus" | "vscode-light-plus" | "vscode-high-contrast";
+type ConfigDialogMode = "create" | "edit";
 
 type EnvStatus = 
   | { status: "NotInitialized" }
@@ -34,11 +40,78 @@ interface EnvSetupProgress {
   progress: number;
 }
 
+interface LlmConfigFormState {
+  serviceName: string;
+  engine: EngineId;
+  model: string;
+  apiKey: string;
+  baseUrl: string;
+  active: boolean;
+  extraParams: EngineExtraParam[];
+}
+
+interface TranslationAdvancedOptions {
+  primaryFontFamily: FontFamilyOption;
+  dualDisplayMode: DualDisplayModeOption;
+  ocrWorkaround: boolean;
+  autoEnableOcrWorkaround: boolean;
+  noWatermarkMode: boolean;
+  saveAutoExtractedGlossary: boolean;
+  noAutoExtractGlossary: boolean;
+  enhanceCompatibility: boolean;
+  translateTableText: boolean;
+  onlyIncludeTranslatedPage: boolean;
+}
+
 const MIN_SIDEBAR_WIDTH = 220;
 const MAX_SIDEBAR_WIDTH = 520;
 const DEFAULT_SIDEBAR_WIDTH = 320;
-const DEFAULT_ENGINE = "OpenAI";
-const ENGINE_OPTIONS = ["OpenAI", "Google", "Bing", "DeepSeek", "Ollama"] as const;
+const MIN_TRANSLATION_QPS = 1;
+const MAX_TRANSLATION_QPS = 32;
+const DEFAULT_TRANSLATION_QPS = 8;
+const DEFAULT_ENGINE: EngineId = "OpenAI";
+const ENGINE_OPTIONS: readonly EngineId[] = ["OpenAI", "Gemini", "DeepSeek", "Kimi", "Zhipu"];
+const ENGINE_ALIASES: Record<string, EngineId> = {
+  openai: "OpenAI",
+  gpt: "OpenAI",
+  gemini: "Gemini",
+  google: "Gemini",
+  deepseek: "DeepSeek",
+  kimi: "Kimi",
+  moonshot: "Kimi",
+  zhipu: "Zhipu",
+  glm: "Zhipu",
+  "智普": "Zhipu",
+};
+const ENGINE_DEFAULTS: Record<EngineId, { model: string; baseUrl: string }> = {
+  OpenAI: {
+    model: "gpt-4o-mini",
+    baseUrl: "https://api.openai.com/v1",
+  },
+  Gemini: {
+    model: "gemini-1.5-flash",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+  },
+  DeepSeek: {
+    model: "deepseek-chat",
+    baseUrl: "https://api.deepseek.com/v1",
+  },
+  Kimi: {
+    model: "moonshot-v1-8k",
+    baseUrl: "https://api.moonshot.cn/v1",
+  },
+  Zhipu: {
+    model: "glm-4-flash",
+    baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+  },
+};
+const ENGINE_MODEL_OPTIONS: Record<EngineId, string[]> = {
+  OpenAI: ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"],
+  Gemini: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash"],
+  DeepSeek: ["deepseek-chat", "deepseek-reasoner"],
+  Kimi: ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+  Zhipu: ["glm-4-flash", "glm-4-plus", "glm-4-air"],
+};
 const THEME_OPTIONS: Array<{ id: ThemeId; label: string }> = [
   { id: "vscode-dark-plus", label: "Dark+（默认深色）" },
   { id: "vscode-light-plus", label: "Light+（默认浅色）" },
@@ -51,8 +124,13 @@ interface PersistedSettings {
   langOut: string;
   engine: string;
   mode: "mono" | "dual" | "both";
+  translationQps: number;
+  translationAdvancedOptions: TranslationAdvancedOptions;
+  advancedOptionsExpanded?: boolean;
   engineConfigs: Record<string, EngineConnectionConfig>;
-  pythonCmd: string;
+  engineDisplayNames: Record<string, string>;
+  engineExtraParams: Record<string, EngineExtraParam[]>;
+  llmEngineOrder: string[];
   queueLimit: number;
   syncScrollEnabled: boolean;
   sidebarView: SidebarView;
@@ -89,12 +167,127 @@ const TARGET_LANGUAGE_OPTIONS: LangOption[] = SOURCE_LANGUAGE_OPTIONS.filter(
   (item) => item.value !== "auto",
 );
 
+const FONT_FAMILY_OPTIONS: Array<{ value: FontFamilyOption; label: string }> = [
+  { value: "auto", label: "auto" },
+  { value: "serif", label: "serif" },
+  { value: "sans-serif", label: "sans-serif" },
+  { value: "script", label: "script" },
+];
+
+const DUAL_DISPLAY_MODE_OPTIONS: Array<{ value: DualDisplayModeOption; label: string }> = [
+  { value: "left-right", label: "Left & Right" },
+  { value: "alternating-pages", label: "Alternating Pages" },
+];
+
+const DEFAULT_TRANSLATION_ADVANCED_OPTIONS: TranslationAdvancedOptions = {
+  primaryFontFamily: "auto",
+  dualDisplayMode: "left-right",
+  ocrWorkaround: false,
+  autoEnableOcrWorkaround: false,
+  noWatermarkMode: false,
+  saveAutoExtractedGlossary: false,
+  noAutoExtractGlossary: false,
+  enhanceCompatibility: false,
+  translateTableText: true,
+  onlyIncludeTranslatedPage: false,
+};
+
+function normalizeEngineName(value: string): EngineId | null {
+  const raw = value.trim();
+  if (!raw) {
+    return null;
+  }
+  if (ENGINE_OPTIONS.includes(raw as EngineId)) {
+    return raw as EngineId;
+  }
+  return ENGINE_ALIASES[raw] ?? ENGINE_ALIASES[raw.toLowerCase()] ?? null;
+}
+
 function defaultEngineConfig(engine: string): EngineConnectionConfig {
+  const normalized = normalizeEngineName(engine) ?? DEFAULT_ENGINE;
+  const defaults = ENGINE_DEFAULTS[normalized];
   return {
     apiKey: "",
-    model: engine === DEFAULT_ENGINE ? "gpt-4o-mini" : "",
-    baseUrl: "",
+    model: defaults.model,
+    baseUrl: defaults.baseUrl,
   };
+}
+
+function defaultEngineDisplayName(engine: string): string {
+  const normalized = normalizeEngineName(engine) ?? DEFAULT_ENGINE;
+  return normalized.toLowerCase();
+}
+
+function normalizeEngineDisplayNames(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (value && typeof value === "object") {
+    for (const [engine, name] of Object.entries(value as Record<string, unknown>)) {
+      const normalized = normalizeEngineName(engine) ?? engine;
+      if (typeof name === "string" && name.trim().length > 0) {
+        out[normalized] = name.trim();
+      }
+    }
+  }
+  for (const engine of ENGINE_OPTIONS) {
+    if (!out[engine]) {
+      out[engine] = defaultEngineDisplayName(engine);
+    }
+  }
+  return out;
+}
+
+function normalizeExtraParam(value: unknown): EngineExtraParam | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const key = typeof record.key === "string" ? record.key.trim() : "";
+  const val = typeof record.value === "string" ? record.value.trim() : "";
+  if (!key && !val) {
+    return null;
+  }
+  return { key, value: val };
+}
+
+function normalizeEngineExtraParams(value: unknown): Record<string, EngineExtraParam[]> {
+  const out: Record<string, EngineExtraParam[]> = {};
+  if (value && typeof value === "object") {
+    for (const [engine, params] of Object.entries(value as Record<string, unknown>)) {
+      const normalized = normalizeEngineName(engine) ?? engine;
+      if (Array.isArray(params)) {
+        out[normalized] = params
+          .map(normalizeExtraParam)
+          .filter((item): item is EngineExtraParam => item !== null);
+      }
+    }
+  }
+  for (const engine of ENGINE_OPTIONS) {
+    if (!out[engine]) {
+      out[engine] = [];
+    }
+  }
+  return out;
+}
+
+function normalizeLlmEngineOrder(value: unknown): EngineId[] {
+  const list: EngineId[] = [];
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item !== "string") {
+        continue;
+      }
+      const normalized = normalizeEngineName(item);
+      if (normalized && !list.includes(normalized)) {
+        list.push(normalized);
+      }
+    }
+  }
+  for (const engine of ENGINE_OPTIONS) {
+    if (!list.includes(engine)) {
+      list.push(engine);
+    }
+  }
+  return list;
 }
 
 function normalizeEngineConfig(value: unknown, engine: string): EngineConnectionConfig {
@@ -114,8 +307,9 @@ function normalizeEngineConfigs(value: unknown): Record<string, EngineConnection
   const out: Record<string, EngineConnectionConfig> = {};
   if (value && typeof value === "object") {
     for (const [engine, config] of Object.entries(value as Record<string, unknown>)) {
-      if (engine.length > 0) {
-        out[engine] = normalizeEngineConfig(config, engine);
+      const normalizedEngine = normalizeEngineName(engine) ?? engine;
+      if (normalizedEngine.length > 0) {
+        out[normalizedEngine] = normalizeEngineConfig(config, normalizedEngine);
       }
     }
   }
@@ -128,10 +322,32 @@ function normalizeEngineConfigs(value: unknown): Record<string, EngineConnection
 }
 
 function normalizeEngine(value: unknown): string {
-  if (typeof value === "string" && value.trim().length > 0) {
-    return value;
+  if (typeof value === "string") {
+    const normalized = normalizeEngineName(value);
+    if (normalized) {
+      return normalized;
+    }
   }
   return DEFAULT_ENGINE;
+}
+
+function maskApiKey(apiKey: string): string {
+  if (!apiKey) {
+    return "-";
+  }
+  if (apiKey.length <= 10) {
+    return `${apiKey.slice(0, 2)}***`;
+  }
+  return `${apiKey.slice(0, 4)}...${apiKey.slice(-3)}`;
+}
+
+function truncateMiddle(value: string, maxLength: number): string {
+  if (!value || value.length <= maxLength) {
+    return value || "-";
+  }
+  const head = Math.max(4, Math.floor(maxLength * 0.5));
+  const tail = Math.max(3, maxLength - head - 3);
+  return `${value.slice(0, head)}...${value.slice(-tail)}`;
 }
 
 function getEngineConfig(
@@ -175,6 +391,25 @@ function loadPersistedSettings(): Partial<PersistedSettings> {
   } catch {
     return {};
   }
+}
+
+function createLlmConfigForm(
+  targetEngine: EngineId,
+  engineConfigs: Record<string, EngineConnectionConfig>,
+  engineDisplayNames: Record<string, string>,
+  engineExtraParams: Record<string, EngineExtraParam[]>,
+  activeEngine: string,
+): LlmConfigFormState {
+  const config = getEngineConfig(engineConfigs, targetEngine);
+  return {
+    serviceName: engineDisplayNames[targetEngine] ?? defaultEngineDisplayName(targetEngine),
+    engine: targetEngine,
+    model: config.model,
+    apiKey: config.apiKey,
+    baseUrl: config.baseUrl,
+    active: activeEngine === targetEngine,
+    extraParams: [...(engineExtraParams[targetEngine] ?? [])],
+  };
 }
 
 function getOutputPath(task: TranslationTask): string | null {
@@ -275,7 +510,7 @@ function discoverTranslatedMap(pdfPaths: string[], langOut: string): Record<stri
 }
 
 function normalizeSidebarView(value: unknown): SidebarView {
-  if (value === "explorer" || value === "translate" || value === "tasks") {
+  if (value === "explorer" || value === "translate" || value === "llm" || value === "tasks") {
     return value;
   }
   return "explorer";
@@ -288,12 +523,22 @@ function clampSidebarWidth(width: number): number {
   return Math.max(MIN_SIDEBAR_WIDTH, Math.min(width, MAX_SIDEBAR_WIDTH));
 }
 
+function clampTranslationQps(qps: number): number {
+  if (Number.isNaN(qps)) {
+    return DEFAULT_TRANSLATION_QPS;
+  }
+  return Math.max(MIN_TRANSLATION_QPS, Math.min(qps, MAX_TRANSLATION_QPS));
+}
+
 function sidebarTitle(view: SidebarView): string {
   if (view === "explorer") {
     return "文档目录";
   }
   if (view === "translate") {
-    return "翻译与设置";
+    return "翻译设置";
+  }
+  if (view === "llm") {
+    return "LLM 配置";
   }
   return "任务";
 }
@@ -310,6 +555,71 @@ function normalizeThemeId(value: unknown): ThemeId {
     return value;
   }
   return "vscode-dark-plus";
+}
+
+function mapThemeIdToAppTheme(themeId: ThemeId): "light" | "dark" {
+  if (themeId === "vscode-light-plus") {
+    return "light";
+  }
+  return "dark";
+}
+
+function normalizeBoolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  return fallback;
+}
+
+function normalizeFontFamilyOption(value: unknown): FontFamilyOption {
+  if (value === "serif" || value === "sans-serif" || value === "script" || value === "auto") {
+    return value;
+  }
+  return "auto";
+}
+
+function normalizeDualDisplayModeOption(value: unknown): DualDisplayModeOption {
+  if (value === "left-right" || value === "alternating-pages") {
+    return value;
+  }
+  return "left-right";
+}
+
+function normalizeTranslationAdvancedOptions(value: unknown): TranslationAdvancedOptions {
+  if (!value || typeof value !== "object") {
+    return { ...DEFAULT_TRANSLATION_ADVANCED_OPTIONS };
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    primaryFontFamily: normalizeFontFamilyOption(record.primaryFontFamily),
+    dualDisplayMode: normalizeDualDisplayModeOption(record.dualDisplayMode),
+    ocrWorkaround: normalizeBoolean(record.ocrWorkaround, DEFAULT_TRANSLATION_ADVANCED_OPTIONS.ocrWorkaround),
+    autoEnableOcrWorkaround: normalizeBoolean(
+      record.autoEnableOcrWorkaround,
+      DEFAULT_TRANSLATION_ADVANCED_OPTIONS.autoEnableOcrWorkaround,
+    ),
+    noWatermarkMode: normalizeBoolean(record.noWatermarkMode, DEFAULT_TRANSLATION_ADVANCED_OPTIONS.noWatermarkMode),
+    saveAutoExtractedGlossary: normalizeBoolean(
+      record.saveAutoExtractedGlossary,
+      DEFAULT_TRANSLATION_ADVANCED_OPTIONS.saveAutoExtractedGlossary,
+    ),
+    noAutoExtractGlossary: normalizeBoolean(
+      record.noAutoExtractGlossary,
+      DEFAULT_TRANSLATION_ADVANCED_OPTIONS.noAutoExtractGlossary,
+    ),
+    enhanceCompatibility: normalizeBoolean(
+      record.enhanceCompatibility,
+      DEFAULT_TRANSLATION_ADVANCED_OPTIONS.enhanceCompatibility,
+    ),
+    translateTableText: normalizeBoolean(
+      record.translateTableText,
+      DEFAULT_TRANSLATION_ADVANCED_OPTIONS.translateTableText,
+    ),
+    onlyIncludeTranslatedPage: normalizeBoolean(
+      record.onlyIncludeTranslatedPage,
+      DEFAULT_TRANSLATION_ADVANCED_OPTIONS.onlyIncludeTranslatedPage,
+    ),
+  };
 }
 
 function ActivityIcon({ view }: { view: SidebarView }) {
@@ -331,6 +641,18 @@ function ActivityIcon({ view }: { view: SidebarView }) {
         <path d="M14 9h6" />
         <path d="M17 9v8" />
         <path d="M14.5 15h5" />
+      </svg>
+    );
+  }
+
+  if (view === "llm") {
+    return (
+      <svg className="activity-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="4" y="4" width="16" height="16" rx="2.5" />
+        <path d="M8 9h8" />
+        <path d="M8 13h4" />
+        <path d="M8 17h6" />
+        <circle cx="17.5" cy="13.5" r="1.5" />
       </svg>
     );
   }
@@ -435,10 +757,41 @@ export default function App() {
   const [langOut, setLangOut] = useState(persisted.langOut ?? "zh");
   const [engine, setEngine] = useState(initialEngine);
   const [mode, setMode] = useState<"mono" | "dual" | "both">(persisted.mode ?? "both");
+  const [translationQps, setTranslationQps] = useState(
+    clampTranslationQps(Number(persisted.translationQps ?? DEFAULT_TRANSLATION_QPS)),
+  );
+  const [translationAdvancedOptions, setTranslationAdvancedOptions] = useState<TranslationAdvancedOptions>(() =>
+    normalizeTranslationAdvancedOptions(persisted.translationAdvancedOptions),
+  );
+  const [advancedOptionsExpanded, setAdvancedOptionsExpanded] = useState(
+    persisted.advancedOptionsExpanded ?? false,
+  );
   const [engineConfigs, setEngineConfigs] = useState<Record<string, EngineConnectionConfig>>(() =>
     buildInitialEngineConfigs(persisted, initialEngine),
   );
-  const [pythonCmd, setPythonCmd] = useState(persisted.pythonCmd ?? "");
+  const [engineDisplayNames, setEngineDisplayNames] = useState<Record<string, string>>(() =>
+    normalizeEngineDisplayNames(persisted.engineDisplayNames),
+  );
+  const [engineExtraParams, setEngineExtraParams] = useState<Record<string, EngineExtraParam[]>>(() =>
+    normalizeEngineExtraParams(persisted.engineExtraParams),
+  );
+  const [llmEngineOrder, setLlmEngineOrder] = useState<EngineId[]>(() =>
+    normalizeLlmEngineOrder(persisted.llmEngineOrder),
+  );
+  const [selectedConfigEngine, setSelectedConfigEngine] = useState<EngineId>(
+    normalizeEngineName(initialEngine) ?? DEFAULT_ENGINE,
+  );
+  const [configDialogOpen, setConfigDialogOpen] = useState(false);
+  const [configDialogMode, setConfigDialogMode] = useState<ConfigDialogMode>("create");
+  const [configForm, setConfigForm] = useState<LlmConfigFormState>(() =>
+    createLlmConfigForm(
+      normalizeEngineName(initialEngine) ?? DEFAULT_ENGINE,
+      buildInitialEngineConfigs(persisted, initialEngine),
+      normalizeEngineDisplayNames(persisted.engineDisplayNames),
+      normalizeEngineExtraParams(persisted.engineExtraParams),
+      initialEngine,
+    ),
+  );
 
   const [queueLimit, setQueueLimit] = useState(
     Math.max(1, Math.min(Number(persisted.queueLimit ?? 2), 8)),
@@ -479,6 +832,31 @@ export default function App() {
 
   const selectedPdf = activeTab;
   const activeEngineConfig = useMemo(() => getEngineConfig(engineConfigs, engine), [engine, engineConfigs]);
+  const activeEngineDefaults = useMemo(
+    () => ENGINE_DEFAULTS[normalizeEngineName(engine) ?? DEFAULT_ENGINE],
+    [engine],
+  );
+  const orderedLlmEngines = useMemo(() => normalizeLlmEngineOrder(llmEngineOrder), [llmEngineOrder]);
+  const llmConfigRows = useMemo(
+    () =>
+      orderedLlmEngines.map((item) => {
+        const config = getEngineConfig(engineConfigs, item);
+        return {
+          engine: item,
+          serviceName: engineDisplayNames[item] ?? defaultEngineDisplayName(item),
+          model: config.model || ENGINE_DEFAULTS[item].model,
+          baseUrl: config.baseUrl || ENGINE_DEFAULTS[item].baseUrl,
+          apiKey: config.apiKey,
+          active: engine === item,
+          extraParams: engineExtraParams[item] ?? [],
+        };
+      }),
+    [engine, engineConfigs, engineDisplayNames, engineExtraParams, orderedLlmEngines],
+  );
+  const selectedLlmRow = useMemo(
+    () => llmConfigRows.find((item) => item.engine === selectedConfigEngine) ?? llmConfigRows[0] ?? null,
+    [llmConfigRows, selectedConfigEngine],
+  );
   const translatedCandidate = selectedPdf ? translatedByInput[selectedPdf] ?? null : null;
   const translatedPath =
     translatedCandidate && allPdfPathSet.has(translatedCandidate) ? translatedCandidate : null;
@@ -486,27 +864,159 @@ export default function App() {
   const effectivePreviewLayout: PreviewLayout = hasTranslatedPreview
     ? previewLayout
     : "source";
-  const currentOutputDir = selectedPdf ? dirnameOf(selectedPdf) : rootDir || "-";
+  const isLlmConfigView = sidebarView === "llm";
   const selectedPdfLabel = selectedPdf ? fileLabel(selectedPdf) : "未选择文件";
 
-  const updateCurrentEngineConfig = useCallback(
-    (key: keyof EngineConnectionConfig, value: string) => {
-      setEngineConfigs((prev) => {
-        const current = getEngineConfig(prev, engine);
-        if (current[key] === value) {
-          return prev;
-        }
+  const openCreateConfigDialog = useCallback(() => {
+    const baseEngine =
+      ENGINE_OPTIONS.find((item) => getEngineConfig(engineConfigs, item).apiKey.trim().length === 0) ??
+      selectedLlmRow?.engine ??
+      DEFAULT_ENGINE;
+    const defaults = ENGINE_DEFAULTS[baseEngine];
+    setConfigDialogMode("create");
+    setConfigForm({
+      serviceName: defaultEngineDisplayName(baseEngine),
+      engine: baseEngine,
+      model: defaults.model,
+      apiKey: "",
+      baseUrl: defaults.baseUrl,
+      active: false,
+      extraParams: [],
+    });
+    setConfigDialogOpen(true);
+  }, [engineConfigs, selectedLlmRow?.engine]);
+
+  const openEditConfigDialog = useCallback(() => {
+    const target = selectedLlmRow?.engine;
+    if (!target) {
+      return;
+    }
+    setConfigDialogMode("edit");
+    setConfigForm(createLlmConfigForm(target, engineConfigs, engineDisplayNames, engineExtraParams, engine));
+    setConfigDialogOpen(true);
+  }, [engine, engineConfigs, engineDisplayNames, engineExtraParams, selectedLlmRow?.engine]);
+
+  const handleConfigFormEngineChange = useCallback(
+    (nextEngine: EngineId) => {
+      setConfigForm((prev) => {
+        const existingConfig = getEngineConfig(engineConfigs, nextEngine);
+        const existingName = engineDisplayNames[nextEngine] ?? defaultEngineDisplayName(nextEngine);
+        const existingParams = engineExtraParams[nextEngine] ?? [];
         return {
           ...prev,
-          [engine]: {
-            ...current,
-            [key]: value,
-          },
+          engine: nextEngine,
+          serviceName: existingName,
+          model: existingConfig.model || ENGINE_DEFAULTS[nextEngine].model,
+          apiKey: existingConfig.apiKey,
+          baseUrl: existingConfig.baseUrl || ENGINE_DEFAULTS[nextEngine].baseUrl,
+          active: engine === nextEngine,
+          extraParams: [...existingParams],
         };
       });
     },
-    [engine],
+    [engine, engineConfigs, engineDisplayNames, engineExtraParams],
   );
+
+  const handleSaveConfigDialog = useCallback(() => {
+    const targetEngine = configForm.engine;
+    const cleanedServiceName = configForm.serviceName.trim() || defaultEngineDisplayName(targetEngine);
+    const cleanedModel = configForm.model.trim() || ENGINE_DEFAULTS[targetEngine].model;
+    const cleanedApiKey = configForm.apiKey.trim();
+    const cleanedBaseUrl = configForm.baseUrl.trim() || ENGINE_DEFAULTS[targetEngine].baseUrl;
+    const cleanedParams = configForm.extraParams
+      .map((item) => ({ key: item.key.trim(), value: item.value.trim() }))
+      .filter((item) => item.key.length > 0);
+    const defaultServiceName = defaultEngineDisplayName(targetEngine);
+    const existing = getEngineConfig(engineConfigs, targetEngine);
+    const existingDisplayName = engineDisplayNames[targetEngine] ?? defaultServiceName;
+    const existingParams = engineExtraParams[targetEngine] ?? [];
+    const hasExistingConfig =
+      existing.apiKey.trim().length > 0 ||
+      existing.model.trim() !== ENGINE_DEFAULTS[targetEngine].model ||
+      existing.baseUrl.trim() !== ENGINE_DEFAULTS[targetEngine].baseUrl ||
+      existingDisplayName !== defaultServiceName ||
+      existingParams.length > 0;
+
+    if (configForm.active && cleanedApiKey.length === 0) {
+      setStatusNote("激活服务前请先填写 API Key。");
+      return;
+    }
+    if (
+      configDialogMode === "create" &&
+      hasExistingConfig &&
+      !window.confirm(`${targetEngine} 已存在配置，确认覆盖吗？`)
+    ) {
+      return;
+    }
+
+    setEngineConfigs((prev) => ({
+      ...prev,
+      [targetEngine]: {
+        apiKey: cleanedApiKey,
+        model: cleanedModel,
+        baseUrl: cleanedBaseUrl,
+      },
+    }));
+    setEngineDisplayNames((prev) => ({ ...prev, [targetEngine]: cleanedServiceName }));
+    setEngineExtraParams((prev) => ({ ...prev, [targetEngine]: cleanedParams }));
+    setSelectedConfigEngine(targetEngine);
+    if (configForm.active) {
+      setEngine(targetEngine);
+    }
+    setStatusNote(`已保存 ${cleanedServiceName} 配置`);
+    setConfigDialogOpen(false);
+  }, [configDialogMode, configForm, engineConfigs, engineDisplayNames, engineExtraParams]);
+
+  const handleDeleteSelectedConfig = useCallback(() => {
+    const target = selectedLlmRow?.engine;
+    if (!target) {
+      return;
+    }
+    const serviceName = engineDisplayNames[target] ?? defaultEngineDisplayName(target);
+    if (!window.confirm(`确认重置 ${serviceName} 的配置吗？`)) {
+      return;
+    }
+    setEngineConfigs((prev) => ({ ...prev, [target]: defaultEngineConfig(target) }));
+    setEngineDisplayNames((prev) => ({ ...prev, [target]: defaultEngineDisplayName(target) }));
+    setEngineExtraParams((prev) => ({ ...prev, [target]: [] }));
+    if (engine === target) {
+      const fallbackEngine =
+        orderedLlmEngines.find(
+          (item) => item !== target && getEngineConfig(engineConfigs, item).apiKey.trim().length > 0,
+        ) ?? DEFAULT_ENGINE;
+      setEngine(fallbackEngine);
+      setSelectedConfigEngine(fallbackEngine);
+    }
+    setStatusNote(`已重置 ${serviceName} 配置`);
+  }, [engine, engineConfigs, engineDisplayNames, orderedLlmEngines, selectedLlmRow?.engine]);
+
+  const handleActivateSelectedConfig = useCallback(() => {
+    const target = selectedLlmRow?.engine;
+    if (!target) {
+      return;
+    }
+    const targetConfig = getEngineConfig(engineConfigs, target);
+    if (targetConfig.apiKey.trim().length === 0) {
+      setStatusNote("请先填写 API Key，再激活该服务。");
+      return;
+    }
+    setEngine(target);
+    setSelectedConfigEngine(target);
+    setStatusNote(`已激活 ${engineDisplayNames[target] ?? target}`);
+  }, [engineConfigs, engineDisplayNames, selectedLlmRow?.engine]);
+
+  const handlePinSelectedConfig = useCallback(() => {
+    const target = selectedLlmRow?.engine;
+    if (!target) {
+      return;
+    }
+    setLlmEngineOrder((prev) => {
+      const normalized = normalizeLlmEngineOrder(prev);
+      const rest = normalized.filter((item) => item !== target);
+      return [target, ...rest];
+    });
+    setStatusNote(`已将 ${engineDisplayNames[target] ?? target} 置顶`);
+  }, [engineDisplayNames, selectedLlmRow?.engine]);
 
   const refreshTree = useCallback(async (dir: string) => {
     try {
@@ -533,6 +1043,68 @@ export default function App() {
     });
   };
 
+  const updateTranslationAdvancedOption = useCallback(
+    <K extends keyof TranslationAdvancedOptions>(key: K, value: TranslationAdvancedOptions[K]) => {
+      setTranslationAdvancedOptions((prev) => {
+        const next = { ...prev, [key]: value };
+        if (key === "ocrWorkaround" && value === true) {
+          next.autoEnableOcrWorkaround = false;
+        }
+        if (key === "autoEnableOcrWorkaround" && value === true) {
+          next.ocrWorkaround = false;
+        }
+        if (key === "noAutoExtractGlossary" && value === true) {
+          next.saveAutoExtractedGlossary = false;
+        }
+        if (key === "saveAutoExtractedGlossary" && value === true) {
+          next.noAutoExtractGlossary = false;
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const advancedOptionChangesCount = useMemo(() => {
+    let changes = 0;
+    if (translationAdvancedOptions.primaryFontFamily !== DEFAULT_TRANSLATION_ADVANCED_OPTIONS.primaryFontFamily) {
+      changes += 1;
+    }
+    if (translationAdvancedOptions.dualDisplayMode !== DEFAULT_TRANSLATION_ADVANCED_OPTIONS.dualDisplayMode) {
+      changes += 1;
+    }
+    if (translationAdvancedOptions.ocrWorkaround) {
+      changes += 1;
+    }
+    if (translationAdvancedOptions.autoEnableOcrWorkaround) {
+      changes += 1;
+    }
+    if (translationAdvancedOptions.noWatermarkMode) {
+      changes += 1;
+    }
+    if (translationAdvancedOptions.saveAutoExtractedGlossary) {
+      changes += 1;
+    }
+    if (translationAdvancedOptions.noAutoExtractGlossary) {
+      changes += 1;
+    }
+    if (translationAdvancedOptions.enhanceCompatibility) {
+      changes += 1;
+    }
+    if (translationAdvancedOptions.translateTableText !== DEFAULT_TRANSLATION_ADVANCED_OPTIONS.translateTableText) {
+      changes += 1;
+    }
+    if (translationAdvancedOptions.onlyIncludeTranslatedPage) {
+      changes += 1;
+    }
+    return changes;
+  }, [translationAdvancedOptions]);
+
+  const resetTranslationAdvancedOptions = useCallback(() => {
+    setTranslationAdvancedOptions({ ...DEFAULT_TRANSLATION_ADVANCED_OPTIONS });
+    setStatusNote("高级选项已恢复默认值");
+  }, []);
+
   const startTranslationForPath = useCallback(
     async (inputPath: string) => {
       const request: TranslationRequest = {
@@ -542,10 +1114,20 @@ export default function App() {
         langOut,
         engine,
         mode,
-        pythonCmd: pythonCmd.trim() || undefined,
+        qps: clampTranslationQps(translationQps),
         apiKey: activeEngineConfig.apiKey.trim() || undefined,
         model: activeEngineConfig.model.trim() || undefined,
         baseUrl: activeEngineConfig.baseUrl.trim() || undefined,
+        primaryFontFamily: translationAdvancedOptions.primaryFontFamily,
+        useAlternatingPagesDual: translationAdvancedOptions.dualDisplayMode === "alternating-pages",
+        ocrWorkaround: translationAdvancedOptions.ocrWorkaround,
+        autoEnableOcrWorkaround: translationAdvancedOptions.autoEnableOcrWorkaround,
+        noWatermarkMode: translationAdvancedOptions.noWatermarkMode,
+        saveAutoExtractedGlossary: translationAdvancedOptions.saveAutoExtractedGlossary,
+        noAutoExtractGlossary: translationAdvancedOptions.noAutoExtractGlossary,
+        enhanceCompatibility: translationAdvancedOptions.enhanceCompatibility,
+        translateTableText: translationAdvancedOptions.translateTableText,
+        onlyIncludeTranslatedPage: translationAdvancedOptions.onlyIncludeTranslatedPage,
       };
 
 
@@ -556,7 +1138,7 @@ export default function App() {
       }));
       return task;
     },
-    [activeEngineConfig, engine, langIn, langOut, mode, pythonCmd],
+    [activeEngineConfig, engine, langIn, langOut, mode, translationAdvancedOptions, translationQps],
   );
 
   const handleTranslateCurrent = async () => {
@@ -564,8 +1146,12 @@ export default function App() {
       setStatusNote("请先在左侧选择 PDF");
       return;
     }
-    await startTranslationForPath(selectedPdf);
-    setStatusNote("当前文件已加入翻译队列");
+    try {
+      await startTranslationForPath(selectedPdf);
+      setStatusNote("当前文件已加入翻译队列");
+    } catch (err) {
+      setStatusNote(err instanceof Error ? err.message : String(err));
+    }
   };
 
   const handleOpenFolder = async () => {
@@ -627,6 +1213,9 @@ export default function App() {
     setSidebarView(view);
     if (!sidebarVisible) {
       setSidebarVisible(true);
+    }
+    if (view === "llm") {
+      setSelectedConfigEngine(normalizeEngineName(engine) ?? DEFAULT_ENGINE);
     }
   };
 
@@ -705,7 +1294,7 @@ export default function App() {
           <div className="sidebar-info" title={selectedPdf ?? ""}>
             当前文件: {selectedPdfLabel}
           </div>
-          <div className="sidebar-subtitle">翻译参数</div>
+          <div className="sidebar-subtitle">翻译设置</div>
           <div className="compact-grid translate-params-grid">
             <label>
               源语言
@@ -742,7 +1331,22 @@ export default function App() {
               </select>
             </label>
             <label className="span-2">
-              并发上限
+              翻译速度 (QPS)
+              <input
+                type="number"
+                min={MIN_TRANSLATION_QPS}
+                max={MAX_TRANSLATION_QPS}
+                value={translationQps}
+                onChange={(e) => {
+                  const next = Number(e.target.value);
+                  if (!Number.isNaN(next)) {
+                    setTranslationQps(clampTranslationQps(next));
+                  }
+                }}
+              />
+            </label>
+            <label className="span-2">
+              并发任务数
               <input
                 type="number"
                 min={1}
@@ -757,61 +1361,152 @@ export default function App() {
               />
             </label>
           </div>
-
-          <div className="sidebar-subtitle">引擎与模型连接</div>
-          <div className="stack-form">
-            <label>
-              引擎
-              <select value={engine} onChange={(e) => setEngine(e.target.value)}>
-                {!ENGINE_OPTIONS.some((item) => item === engine) && <option value={engine}>{engine}</option>}
-                {ENGINE_OPTIONS.map((item) => (
-                  <option key={item} value={item}>
-                    {item}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              API Key
-              <input
-                type="password"
-                value={activeEngineConfig.apiKey}
-                onChange={(e) => updateCurrentEngineConfig("apiKey", e.target.value)}
-                placeholder="仅保存在本地"
-              />
-            </label>
-            <label>
-              模型
-              <input
-                value={activeEngineConfig.model}
-                onChange={(e) => updateCurrentEngineConfig("model", e.target.value)}
-                placeholder="例如 gpt-4o-mini"
-              />
-            </label>
-            <label>
-              Base URL
-              <input
-                value={activeEngineConfig.baseUrl}
-                onChange={(e) => updateCurrentEngineConfig("baseUrl", e.target.value)}
-                placeholder="https://api.openai.com/v1"
-              />
-            </label>
-            <label>
-              Python 命令
-              <input value={pythonCmd} onChange={(e) => setPythonCmd(e.target.value)} placeholder="python3" />
-            </label>
-            <label className="toggle-line">
-              <input
-                type="checkbox"
-                checked={syncScrollEnabled}
-                onChange={(e) => setSyncScrollEnabled(e.target.checked)}
-              />
-              <span>双栏同步滚动</span>
-            </label>
+          <div className="sidebar-section-header">
+            <button
+              type="button"
+              className="sidebar-section-toggle"
+              onClick={() => setAdvancedOptionsExpanded((prev) => !prev)}
+              aria-expanded={advancedOptionsExpanded}
+            >
+              <span>{advancedOptionsExpanded ? "▾" : "▸"}</span>
+              <span>高级选项</span>
+            </button>
+            <button
+              type="button"
+              className="sidebar-section-reset"
+              onClick={resetTranslationAdvancedOptions}
+              disabled={advancedOptionChangesCount === 0}
+            >
+              重置默认
+            </button>
           </div>
+          {!advancedOptionsExpanded && (
+            <div className="sidebar-kv">已启用高级项: {advancedOptionChangesCount}</div>
+          )}
+          {advancedOptionsExpanded && (
+            <>
+              <div className="compact-grid translate-advanced-grid">
+                <label>
+                  选择字体
+                  <select
+                    value={translationAdvancedOptions.primaryFontFamily}
+                    onChange={(e) =>
+                      updateTranslationAdvancedOption("primaryFontFamily", e.target.value as FontFamilyOption)
+                    }
+                  >
+                    {FONT_FAMILY_OPTIONS.map((item) => (
+                      <option key={item.value} value={item.value}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  双语(Dual)文件显示模式
+                  <select
+                    value={translationAdvancedOptions.dualDisplayMode}
+                    onChange={(e) =>
+                      updateTranslationAdvancedOption("dualDisplayMode", e.target.value as DualDisplayModeOption)
+                    }
+                  >
+                    {DUAL_DISPLAY_MODE_OPTIONS.map((item) => (
+                      <option key={item.value} value={item.value}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="translate-option-check-grid">
+                <label className="translate-option-check">
+                  <input
+                    type="checkbox"
+                    checked={translationAdvancedOptions.ocrWorkaround}
+                    onChange={(e) => updateTranslationAdvancedOption("ocrWorkaround", e.target.checked)}
+                  />
+                  <span>强制开启OCR版临时解决方案（不推荐）</span>
+                </label>
+                <label className="translate-option-check">
+                  <input
+                    type="checkbox"
+                    checked={translationAdvancedOptions.autoEnableOcrWorkaround}
+                    onChange={(e) => updateTranslationAdvancedOption("autoEnableOcrWorkaround", e.target.checked)}
+                  />
+                  <span>自动开启OCR版临时解决方案</span>
+                </label>
+                <label className="translate-option-check">
+                  <input
+                    type="checkbox"
+                    checked={translationAdvancedOptions.noWatermarkMode}
+                    onChange={(e) => updateTranslationAdvancedOption("noWatermarkMode", e.target.checked)}
+                  />
+                  <span>无水印模式</span>
+                </label>
+                <label className="translate-option-check">
+                  <input
+                    type="checkbox"
+                    checked={translationAdvancedOptions.saveAutoExtractedGlossary}
+                    onChange={(e) => updateTranslationAdvancedOption("saveAutoExtractedGlossary", e.target.checked)}
+                  />
+                  <span>保存自动提取术语表</span>
+                </label>
+                <label className="translate-option-check">
+                  <input
+                    type="checkbox"
+                    checked={translationAdvancedOptions.noAutoExtractGlossary}
+                    onChange={(e) => updateTranslationAdvancedOption("noAutoExtractGlossary", e.target.checked)}
+                  />
+                  <span>禁用自动术语提取</span>
+                </label>
+                <label className="translate-option-check">
+                  <input
+                    type="checkbox"
+                    checked={translationAdvancedOptions.enhanceCompatibility}
+                    onChange={(e) => updateTranslationAdvancedOption("enhanceCompatibility", e.target.checked)}
+                  />
+                  <span>兼容性模式（自动启用必要兼容策略）</span>
+                </label>
+                <label className="translate-option-check">
+                  <input
+                    type="checkbox"
+                    checked={translationAdvancedOptions.translateTableText}
+                    onChange={(e) => updateTranslationAdvancedOption("translateTableText", e.target.checked)}
+                  />
+                  <span>翻译表格文本（Experimental）</span>
+                </label>
+                <label className="translate-option-check">
+                  <input
+                    type="checkbox"
+                    checked={translationAdvancedOptions.onlyIncludeTranslatedPage}
+                    onChange={(e) => updateTranslationAdvancedOption("onlyIncludeTranslatedPage", e.target.checked)}
+                  />
+                  <span>PDF仅包含选择翻译的页面</span>
+                </label>
+              </div>
+            </>
+          )}
+        </section>
+      );
+    }
 
-          <div className="sidebar-kv">运行: {runningCount}</div>
-          <div className="sidebar-kv" title={currentOutputDir}>输出目录: {currentOutputDir}</div>
+    if (sidebarView === "llm") {
+      return (
+        <section className="sidebar-block sidebar-form-view">
+          <div className="sidebar-subtitle">LLM API 配置</div>
+          <div className="llm-quick-card">
+            <div className="sidebar-kv">当前激活服务: {engineDisplayNames[engine] ?? engine}</div>
+            <div className="sidebar-kv">当前模型: {activeEngineConfig.model || activeEngineDefaults.model}</div>
+            <div className="sidebar-kv">配置已在右侧主区域打开</div>
+            <button
+              type="button"
+              className="sidebar-open-folder-btn"
+              onClick={() => {
+                setSelectedConfigEngine(normalizeEngineName(engine) ?? DEFAULT_ENGINE);
+              }}
+            >
+              刷新到当前激活服务
+            </button>
+          </div>
         </section>
       );
     }
@@ -819,6 +1514,226 @@ export default function App() {
     return (
       <section className="sidebar-block sidebar-block-fill">
         <TaskPanel tasks={tasks} onUseOutput={handleUseOutput} onCancel={handleCancel} />
+      </section>
+    );
+  };
+
+  const renderLlmConfigPage = () => {
+    const currentEngine = selectedLlmRow?.engine ?? DEFAULT_ENGINE;
+    const extraParamSummary =
+      selectedLlmRow && selectedLlmRow.extraParams.length > 0
+        ? selectedLlmRow.extraParams.map((item) => `${item.key}=${item.value}`).join("; ")
+        : "-";
+
+    return (
+      <section className="llm-config-page">
+        <div className="llm-config-header">
+          <div>
+            <h2>LLM API 配置管理</h2>
+            <p>请在此处维护模型服务配置，翻译时将使用已激活的服务。</p>
+          </div>
+        </div>
+
+        <div className="llm-config-table-wrap">
+          <table className="llm-config-table">
+            <thead>
+              <tr>
+                <th>服务</th>
+                <th>模型</th>
+                <th>API URL</th>
+                <th>API Key</th>
+                <th>激活</th>
+                <th>额外参数</th>
+              </tr>
+            </thead>
+            <tbody>
+              {llmConfigRows.map((row) => (
+                <tr
+                  key={row.engine}
+                  className={selectedConfigEngine === row.engine ? "selected" : ""}
+                  onClick={() => setSelectedConfigEngine(row.engine)}
+                >
+                  <td>{row.serviceName}</td>
+                  <td>{row.model || ENGINE_DEFAULTS[row.engine].model}</td>
+                  <td title={row.baseUrl || ENGINE_DEFAULTS[row.engine].baseUrl}>
+                    {truncateMiddle(row.baseUrl || ENGINE_DEFAULTS[row.engine].baseUrl, 36)}
+                  </td>
+                  <td title={row.apiKey || "-"}>
+                    {maskApiKey(row.apiKey)}
+                  </td>
+                  <td>{row.active ? "✅" : ""}</td>
+                  <td title={row.extraParams.map((item) => `${item.key}=${item.value}`).join("; ") || "-"}>
+                    {row.extraParams.length > 0 ? `${row.extraParams.length} 项` : "-"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="llm-config-actions">
+          <button type="button" onClick={openCreateConfigDialog}>新增</button>
+          <button type="button" onClick={handleDeleteSelectedConfig} disabled={!selectedLlmRow}>删除</button>
+          <button type="button" onClick={openEditConfigDialog} disabled={!selectedLlmRow}>编辑</button>
+          <button
+            type="button"
+            onClick={handleActivateSelectedConfig}
+            disabled={!selectedLlmRow || selectedLlmRow.active}
+          >
+            激活
+          </button>
+          <button type="button" onClick={handlePinSelectedConfig} disabled={!selectedLlmRow}>置顶</button>
+        </div>
+
+        <div className="llm-config-current">
+          <span>当前选中: {engineDisplayNames[currentEngine] ?? currentEngine}</span>
+          <span title={extraParamSummary}>额外参数: {truncateMiddle(extraParamSummary, 50)}</span>
+        </div>
+
+        {configDialogOpen && (
+          <div className="llm-config-dialog-backdrop">
+            <div className="llm-config-dialog" role="dialog" aria-modal="true" aria-label="LLM API 配置编辑">
+              <h3>{configDialogMode === "create" ? "添加新的 LLM API 配置" : "编辑 LLM API 配置"}</h3>
+              <div className="llm-config-dialog-form">
+                <label>
+                  LLM服务名称 *
+                  <input
+                    value={configForm.serviceName}
+                    onChange={(e) => setConfigForm((prev) => ({ ...prev, serviceName: e.target.value }))}
+                    placeholder="例如 deepseek"
+                  />
+                </label>
+                <label>
+                  服务类型
+                  <select
+                    value={configForm.engine}
+                    onChange={(e) => handleConfigFormEngineChange(e.target.value as EngineId)}
+                    disabled={configDialogMode === "edit"}
+                  >
+                    {ENGINE_OPTIONS.map((item) => (
+                      <option key={item} value={item}>
+                        {item}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  模型名称
+                  <input
+                    value={configForm.model}
+                    onChange={(e) => setConfigForm((prev) => ({ ...prev, model: e.target.value }))}
+                    placeholder={ENGINE_DEFAULTS[configForm.engine].model}
+                  />
+                </label>
+                <label>
+                  常用模型
+                  <select
+                    value=""
+                    onChange={(e) => {
+                      if (!e.target.value) {
+                        return;
+                      }
+                      setConfigForm((prev) => ({ ...prev, model: e.target.value }));
+                      e.target.value = "";
+                    }}
+                  >
+                    <option value="">请选择常用模型</option>
+                    {ENGINE_MODEL_OPTIONS[configForm.engine].map((item) => (
+                      <option key={item} value={item}>
+                        {item}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="span-2">
+                  LLM API KEY
+                  <input
+                    type="password"
+                    value={configForm.apiKey}
+                    onChange={(e) => setConfigForm((prev) => ({ ...prev, apiKey: e.target.value }))}
+                    placeholder="请输入 API 密钥"
+                  />
+                </label>
+                <label className="span-2">
+                  LLM BASE URL
+                  <input
+                    value={configForm.baseUrl}
+                    onChange={(e) => setConfigForm((prev) => ({ ...prev, baseUrl: e.target.value }))}
+                    placeholder={ENGINE_DEFAULTS[configForm.engine].baseUrl}
+                  />
+                </label>
+                <label className="span-2 llm-active-toggle">
+                  <input
+                    type="checkbox"
+                    checked={configForm.active}
+                    onChange={(e) => setConfigForm((prev) => ({ ...prev, active: e.target.checked }))}
+                  />
+                  <span>激活此配置（同类型服务中的其他配置将被停用）</span>
+                </label>
+                <div className="span-2 llm-extra-param-block">
+                  <div className="llm-extra-param-header">
+                    <span>额外参数</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setConfigForm((prev) => ({
+                          ...prev,
+                          extraParams: [...prev.extraParams, { key: "", value: "" }],
+                        }))
+                      }
+                    >
+                      + 添加参数
+                    </button>
+                  </div>
+                  {configForm.extraParams.length === 0 && (
+                    <div className="llm-extra-param-empty">未添加额外参数</div>
+                  )}
+                  {configForm.extraParams.map((item, index) => (
+                    <div key={`${index}-${item.key}`} className="llm-extra-param-row">
+                      <input
+                        value={item.key}
+                        onChange={(e) =>
+                          setConfigForm((prev) => {
+                            const next = [...prev.extraParams];
+                            next[index] = { ...next[index], key: e.target.value };
+                            return { ...prev, extraParams: next };
+                          })
+                        }
+                        placeholder="参数名"
+                      />
+                      <input
+                        value={item.value}
+                        onChange={(e) =>
+                          setConfigForm((prev) => {
+                            const next = [...prev.extraParams];
+                            next[index] = { ...next[index], value: e.target.value };
+                            return { ...prev, extraParams: next };
+                          })
+                        }
+                        placeholder="参数值"
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setConfigForm((prev) => ({
+                            ...prev,
+                            extraParams: prev.extraParams.filter((_, rowIndex) => rowIndex !== index),
+                          }))
+                        }
+                      >
+                        删除
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="llm-config-dialog-actions">
+                <button type="button" className="save" onClick={handleSaveConfigDialog}>保存</button>
+                <button type="button" onClick={() => setConfigDialogOpen(false)}>取消</button>
+              </div>
+            </div>
+          </div>
+        )}
       </section>
     );
   };
@@ -937,14 +1852,34 @@ export default function App() {
   }, [engine]);
 
   useEffect(() => {
+    if (llmConfigRows.length === 0) {
+      return;
+    }
+    if (!selectedConfigEngine || !llmConfigRows.some((item) => item.engine === selectedConfigEngine)) {
+      setSelectedConfigEngine(llmConfigRows[0].engine);
+    }
+  }, [llmConfigRows, selectedConfigEngine]);
+
+  useEffect(() => {
+    if (!isLlmConfigView && configDialogOpen) {
+      setConfigDialogOpen(false);
+    }
+  }, [configDialogOpen, isLlmConfigView]);
+
+  useEffect(() => {
     const payload: PersistedSettings = {
       lastRootDir: rootDir,
       langIn,
       langOut,
       engine,
       mode,
+      translationQps,
+      translationAdvancedOptions,
+      advancedOptionsExpanded,
       engineConfigs,
-      pythonCmd,
+      engineDisplayNames,
+      engineExtraParams,
+      llmEngineOrder,
       queueLimit,
       syncScrollEnabled,
       sidebarView,
@@ -958,10 +1893,15 @@ export default function App() {
   }, [
     engine,
     engineConfigs,
+    engineDisplayNames,
+    engineExtraParams,
+    llmEngineOrder,
     langIn,
     langOut,
     mode,
-    pythonCmd,
+    translationQps,
+    translationAdvancedOptions,
+    advancedOptionsExpanded,
     queueLimit,
     rootDir,
     syncScrollEnabled,
@@ -986,6 +1926,12 @@ export default function App() {
       setOriginPages(0);
     }
   }, [effectivePreviewLayout, selectedPdf, translatedPath]);
+
+  useEffect(() => {
+    void setAppTheme(mapThemeIdToAppTheme(themeId)).catch(() => {
+      // Ignore permission/platform failures in non-desktop preview environments.
+    });
+  }, [themeId]);
 
   useEffect(() => {
     if (dispatchingRef.current || batchQueue.length === 0) {
@@ -1093,9 +2039,17 @@ export default function App() {
               type="button"
               className={`activity-btn${sidebarView === "translate" ? " active" : ""}`}
               onClick={() => handleSidebarSwitch("translate")}
-              title="翻译与设置"
+              title="翻译设置"
             >
               <ActivityIcon view="translate" />
+            </button>
+            <button
+              type="button"
+              className={`activity-btn${sidebarView === "llm" ? " active" : ""}`}
+              onClick={() => handleSidebarSwitch("llm")}
+              title="LLM 配置"
+            >
+              <ActivityIcon view="llm" />
             </button>
             <button
               type="button"
@@ -1175,7 +2129,9 @@ export default function App() {
           />
         )}
 
-        <main className="vsc-editor-area">
+        <main className={`vsc-editor-area${isLlmConfigView ? " model-config-mode" : ""}`}>
+          {isLlmConfigView ? renderLlmConfigPage() : (
+            <>
           <div className="editor-tabs">
             {openTabs.length === 0 && <div className="editor-empty">在侧边栏文件树中打开 PDF 文件</div>}
             {openTabs.map((path) => {
@@ -1205,12 +2161,6 @@ export default function App() {
                 </button>
               );
             })}
-          </div>
-
-          <div className="editor-breadcrumbs">
-            <span className="crumb">工作区</span>
-            <span className="crumb-sep">›</span>
-            <span className="crumb">{selectedPdfLabel}</span>
           </div>
 
           <div className="editor-actions">
@@ -1243,7 +2193,20 @@ export default function App() {
               </button>
             </div>
             <div className="editor-action-buttons">
-              <button type="button" disabled={!selectedPdf} onClick={handleTranslateCurrent}>
+              <label className="editor-scroll-sync-toggle">
+                <input
+                  type="checkbox"
+                  checked={syncScrollEnabled}
+                  onChange={(e) => setSyncScrollEnabled(e.target.checked)}
+                />
+                <span>双栏联动滚动</span>
+              </label>
+              <button
+                type="button"
+                className="translate-current-btn"
+                disabled={!selectedPdf}
+                onClick={handleTranslateCurrent}
+              >
                 翻译当前文件
               </button>
             </div>
@@ -1275,6 +2238,8 @@ export default function App() {
               />
             )}
           </div>
+            </>
+          )}
         </main>
       </div>
 
