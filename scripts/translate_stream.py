@@ -42,7 +42,14 @@ def build_engine_settings(args: argparse.Namespace) -> Any:
         OpenAISettings,
     )
 
-    engine = args.engine.strip().lower()
+    # 调试日志：打印关键配置（脱敏）
+    import sys
+    print(f"DEBUG: Engine selected: {engine}", file=sys.stderr)
+    print(f"DEBUG: Model: {args.model}", file=sys.stderr)
+    print(f"DEBUG: Base URL: {args.base_url}", file=sys.stderr)
+    if args.api_key:
+        masked_key = f"{args.api_key[:4]}****{args.api_key[-4:]}"
+        print(f"DEBUG: API Key: {masked_key}", file=sys.stderr)
 
     if engine == "openai":
         if not args.api_key:
@@ -62,6 +69,16 @@ def build_engine_settings(args: argparse.Namespace) -> Any:
     if engine == "deepseek":
         if not args.api_key:
             raise ValueError("DeepSeek 引擎需要配置 API Key")
+        
+        # 如果用户选了 DeepSeek 但填了自定义 URL，尝试用 OpenAI 路径兼容它
+        if args.base_url and args.base_url.strip():
+            print("DEBUG: Using OpenAI path for DeepSeek with custom Base URL", file=sys.stderr)
+            return OpenAISettings(
+                openai_api_key=args.api_key.strip(),
+                openai_model=args.model or "deepseek-chat",
+                openai_base_url=args.base_url.strip(),
+            )
+
         return DeepSeekSettings(
             deepseek_api_key=args.api_key.strip(),
             deepseek_model=args.model or "deepseek-chat",
@@ -73,7 +90,6 @@ def build_engine_settings(args: argparse.Namespace) -> Any:
             ollama_model=args.model or "gemma2",
         )
 
-    raise ValueError(f"Unsupported engine: {args.engine}")
 
 
 def serialize_translate_result(result: Any) -> dict[str, Any]:
