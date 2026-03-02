@@ -287,10 +287,19 @@ fn keep_output_inside_dir(path: Option<String>, output_dir: &str) -> Option<Stri
 }
 
 fn to_progress(event: &Value) -> Option<f32> {
+    if let Some(overall) = event.get("overall_progress").and_then(|v| v.as_f64()) {
+        return Some(overall.clamp(0.0, 100.0) as f32);
+    }
+
     event
-        .get("overall_progress")
+        .get("stage_progress")
         .and_then(|v| v.as_f64())
-        .map(|v| v.clamp(0.0, 100.0) as f32)
+        .map(|stage| {
+            // Fallback for old/new event payloads without overall_progress.
+            // Map stage progress into a conservative 5~95 range to avoid regressing UI progress.
+            let normalized = stage.clamp(0.0, 100.0) as f32;
+            5.0 + normalized * 0.9
+        })
 }
 
 fn to_message(event: &Value) -> String {
@@ -300,6 +309,22 @@ fn to_message(event: &Value) -> String {
         .or_else(|| event.get("error").and_then(|v| v.as_str()))
         .unwrap_or("处理中")
         .to_string()
+}
+
+fn resolve_task_outputs(task: &mut TranslationTask, request: &TranslationRequest) {
+    if task.mono_output.is_none() && task.dual_output.is_none() {
+        let (mono, dual) =
+            fallback_output_paths(&request.input_path, &request.output_dir, &request.lang_out);
+        task.mono_output = mono;
+        task.dual_output = dual;
+    }
+
+    task.mono_output = keep_output_inside_dir(task.mono_output.clone(), &request.output_dir);
+    task.dual_output = keep_output_inside_dir(task.dual_output.clone(), &request.output_dir);
+}
+
+fn has_translation_outputs(task: &TranslationTask) -> bool {
+    task.mono_output.is_some() || task.dual_output.is_some()
 }
 
 async fn run_translation_task(
@@ -420,7 +445,11 @@ async fn run_translation_task(
     println!("DEBUG: Executing translation command:");
     println!("  Python: {}", python);
     println!("  Script: {}", script_path.display());
-    println!("  Args: {:?}", cmd);
+    println!(
+        "  Engine: {} | Mode: {} | Lang: {} -> {}",
+        request.engine, request.mode, request.lang_in, request.lang_out
+    );
+    println!("  Output: {}", request.output_dir);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -473,7 +502,9 @@ async fn run_translation_task(
 
                 if let Some(task) = update_task(&state, &task_id, |task| match event_type {
                     "progress_start" | "progress_update" | "progress_end" => {
-                        task.progress = to_progress(&event).unwrap_or(task.progress);
+                        if let Some(progress) = to_progress(&event) {
+                            task.progress = task.progress.max(progress);
+                        }
                         task.message = to_message(&event);
                         task.status = "running".to_string();
                     }
@@ -511,27 +542,7 @@ async fn run_translation_task(
                                 });
                         }
 
-                        if task.mono_output.is_none() && task.dual_output.is_none() {
-                            let (mono, dual) = fallback_output_paths(
-                                &request.input_path,
-                                &request.output_dir,
-                                &request.lang_out,
-                            );
-                            task.mono_output = mono;
-                            task.dual_output = dual;
-                        }
-
-                        let normalized_mono =
-                            keep_output_inside_dir(task.mono_output.clone(), &request.output_dir);
-                        let normalized_dual =
-                            keep_output_inside_dir(task.dual_output.clone(), &request.output_dir);
-
-                        if normalized_mono.is_some() {
-                            task.mono_output = normalized_mono;
-                        }
-                        if normalized_dual.is_some() {
-                            task.dual_output = normalized_dual;
-                        }
+                        resolve_task_outputs(task, &request);
                     }
                     _ => {}
                 }) {
@@ -561,27 +572,17 @@ async fn run_translation_task(
             Ok(status) if status.success() => {
                 if let Some(task) = update_task(&state, &task_id, |task| {
                     if task.status == "running" {
-                        task.status = "completed".to_string();
-                        task.progress = 100.0;
-                        task.message = "翻译完成".to_string();
-
-                        let (mono, dual) = fallback_output_paths(
-                            &request.input_path,
-                            &request.output_dir,
-                            &request.lang_out,
-                        );
-                        task.mono_output = task.mono_output.clone().or(mono);
-                        task.dual_output = task.dual_output.clone().or(dual);
-
-                        let normalized_mono =
-                            keep_output_inside_dir(task.mono_output.clone(), &request.output_dir);
-                        let normalized_dual =
-                            keep_output_inside_dir(task.dual_output.clone(), &request.output_dir);
-                        if normalized_mono.is_some() {
-                            task.mono_output = normalized_mono;
-                        }
-                        if normalized_dual.is_some() {
-                            task.dual_output = normalized_dual;
+                        resolve_task_outputs(task, &request);
+                        if has_translation_outputs(task) {
+                            task.status = "completed".to_string();
+                            task.progress = 100.0;
+                            task.message = "翻译完成".to_string();
+                        } else {
+                            task.status = "failed".to_string();
+                            task.progress = task.progress.max(1.0);
+                            task.message =
+                                "翻译进程已结束，但未收到完成事件且未检测到输出文件。请检查 API 配置、网络或任务日志。"
+                                    .to_string();
                         }
                     }
                 }) {
@@ -763,8 +764,53 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::resource_script_candidates;
-    use std::path::Path;
+    use super::{
+        has_translation_outputs, now_iso, resolve_task_outputs, resource_script_candidates,
+        to_progress, TranslationRequest, TranslationTask,
+    };
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    fn build_request(input_path: &Path, output_dir: &Path) -> TranslationRequest {
+        TranslationRequest {
+            input_path: input_path.to_string_lossy().to_string(),
+            output_dir: output_dir.to_string_lossy().to_string(),
+            lang_in: "en".to_string(),
+            lang_out: "zh".to_string(),
+            engine: "OpenAI".to_string(),
+            api_key: None,
+            model: None,
+            base_url: None,
+            qps: None,
+            primary_font_family: None,
+            use_alternating_pages_dual: None,
+            ocr_workaround: None,
+            auto_enable_ocr_workaround: None,
+            no_watermark_mode: None,
+            save_auto_extracted_glossary: None,
+            no_auto_extract_glossary: None,
+            enhance_compatibility: None,
+            translate_table_text: None,
+            only_include_translated_page: None,
+            mode: "both".to_string(),
+        }
+    }
+
+    fn build_task(mono_output: Option<PathBuf>, dual_output: Option<PathBuf>) -> TranslationTask {
+        let now = now_iso();
+        TranslationTask {
+            id: "task-test".to_string(),
+            input_path: "/tmp/input.pdf".to_string(),
+            status: "running".to_string(),
+            progress: 1.0,
+            message: "running".to_string(),
+            mono_output: mono_output.map(|v| v.to_string_lossy().to_string()),
+            dual_output: dual_output.map(|v| v.to_string_lossy().to_string()),
+            started_at: now.clone(),
+            updated_at: now,
+        }
+    }
 
     #[test]
     fn resource_script_candidates_cover_packaged_layouts() {
@@ -783,5 +829,49 @@ mod tests {
                 .join("translate_stream.py")
         );
         assert_eq!(candidates[2], resource_dir.join("translate_stream.py"));
+    }
+
+    #[test]
+    fn to_progress_reads_overall_progress() {
+        let event = json!({ "overall_progress": 27.5 });
+        assert_eq!(to_progress(&event), Some(27.5));
+    }
+
+    #[test]
+    fn to_progress_falls_back_to_stage_progress() {
+        let event = json!({ "stage_progress": 50.0 });
+        assert_eq!(to_progress(&event), Some(50.0));
+    }
+
+    #[test]
+    fn resolve_task_outputs_removes_missing_paths() {
+        let temp = tempdir().expect("create tempdir");
+        let input = temp.path().join("doc.pdf");
+        std::fs::write(&input, b"pdf").expect("write input");
+        let missing = temp.path().join("missing.mono.pdf");
+        let request = build_request(&input, temp.path());
+        let mut task = build_task(Some(missing), None);
+
+        resolve_task_outputs(&mut task, &request);
+        assert!(!has_translation_outputs(&task));
+    }
+
+    #[test]
+    fn resolve_task_outputs_uses_existing_fallback_output() {
+        let temp = tempdir().expect("create tempdir");
+        let input = temp.path().join("doc.pdf");
+        std::fs::write(&input, b"pdf").expect("write input");
+        let mono = temp.path().join("doc.zh.mono.pdf");
+        std::fs::write(&mono, b"translated").expect("write mono output");
+
+        let request = build_request(&input, temp.path());
+        let mut task = build_task(None, None);
+        resolve_task_outputs(&mut task, &request);
+
+        assert!(has_translation_outputs(&task));
+        assert_eq!(
+            task.mono_output.as_deref(),
+            Some(mono.to_string_lossy().as_ref())
+        );
     }
 }

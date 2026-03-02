@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import importlib
 import json
 import os
@@ -33,10 +34,37 @@ ENGINE_ALIASES: dict[str, str] = {
 SUPPORTED_ENGINES = ("openai", "gemini", "deepseek", "kimi", "zhipu")
 MIN_QPS = 1
 MAX_QPS = 32
+SENSITIVE_ARG_KEYS = {"--api-key"}
+HEARTBEAT_INTERVAL_SECONDS = 5.0
+STARTUP_IDLE_TIMEOUT_SECONDS = 60.0
+RUNNING_IDLE_TIMEOUT_SECONDS = 300.0
 
 
 def emit(event: dict[str, Any]) -> None:
     print(json.dumps(event, ensure_ascii=False), flush=True)
+
+
+def sanitize_cli_args(args: list[str]) -> list[str]:
+    sanitized: list[str] = []
+    mask_next = False
+    for item in args:
+        if mask_next:
+            sanitized.append("***")
+            mask_next = False
+            continue
+
+        if item in SENSITIVE_ARG_KEYS:
+            sanitized.append(item)
+            mask_next = True
+            continue
+
+        if item.startswith("--api-key="):
+            sanitized.append("--api-key=***")
+            continue
+
+        sanitized.append(item)
+
+    return sanitized
 
 
 def parse_bool(value: str | bool | None) -> bool:
@@ -74,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enhance-compatibility", type=parse_bool)
     parser.add_argument("--translate-table-text", type=parse_bool)
     parser.add_argument("--only-include-translated-page", type=parse_bool)
-    print(f"DEBUG: Script received args: {sys.argv}", file=sys.stderr)
+    print(f"DEBUG: Script received args: {sanitize_cli_args(sys.argv)}", file=sys.stderr)
     return parser.parse_args()
 
 
@@ -230,6 +258,7 @@ def build_engine_settings(args: argparse.Namespace) -> Any:
             masked_key = f"{api_key[:4]}****{api_key[-4:]}"
         else:
             masked_key = f"{api_key[:2]}****"
+        print(f"DEBUG: API Key length: {len(api_key)}", file=sys.stderr)
         print(f"DEBUG: API Key: {masked_key}", file=sys.stderr)
 
     if engine == "openai":
@@ -328,6 +357,213 @@ def serialize_event(event: dict[str, Any]) -> dict[str, Any]:
     return event
 
 
+def build_heartbeat_event(idle_seconds: float, has_received_event: bool) -> dict[str, Any]:
+    stage = "正在初始化翻译引擎，请稍候…" if not has_received_event else "翻译处理中，请稍候…"
+    progress_cap = 12.0 if not has_received_event else 95.0
+    progress = min(progress_cap, 1.0 + idle_seconds / HEARTBEAT_INTERVAL_SECONDS)
+    return {
+        "type": "progress_update",
+        "stage": stage,
+        "overall_progress": round(progress, 2),
+        "heartbeat": True,
+        "idle_seconds": round(idle_seconds, 1),
+    }
+
+
+def build_timeout_error_event(idle_seconds: float, has_received_event: bool) -> dict[str, Any]:
+    if not has_received_event:
+        reason = (
+            f"连接翻译引擎超时（{idle_seconds:.1f}s 无事件）。"
+            "请检查 API Key、Base URL、模型名称或网络连接。"
+        )
+    else:
+        reason = (
+            f"翻译进程长时间无响应（{idle_seconds:.1f}s 无事件）。"
+            "请检查网络稳定性，或降低并发/QPS后重试。"
+        )
+    return {
+        "type": "error",
+        "error": reason,
+        "error_type": "TranslationTimeoutError",
+        "idle_seconds": round(idle_seconds, 1),
+    }
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def guess_output_paths(
+    input_path: Path,
+    output_dir: Path,
+    lang_out: str,
+    mode: str,
+) -> tuple[str | None, str | None]:
+    stem = input_path.stem
+    lang_variants = list(
+        {
+            lang_out,
+            lang_out.lower(),
+            lang_out.upper(),
+            lang_out.split("-")[0],
+            lang_out.split("_")[0],
+        }
+    )
+
+    candidates: list[Path] = []
+    for lang in lang_variants:
+        for name in (
+            f"{stem}.{lang}.mono.pdf",
+            f"{stem}.{lang}.dual.pdf",
+            f"{stem}-{lang}.mono.pdf",
+            f"{stem}-{lang}.dual.pdf",
+        ):
+            candidates.append(output_dir / name)
+            candidates.append(output_dir / "pdf2zh_files" / name)
+    for name in (f"{stem}-mono.pdf", f"{stem}-dual.pdf", f"{stem}.mono.pdf", f"{stem}.dual.pdf"):
+        candidates.append(output_dir / name)
+        candidates.append(output_dir / "pdf2zh_files" / name)
+
+    # Fallback globbing for version-specific naming variants.
+    for pattern in (f"{stem}*.pdf", f"pdf2zh_files/{stem}*.pdf"):
+        candidates.extend(output_dir.glob(pattern))
+
+    mono: Path | None = None
+    dual: Path | None = None
+    filtered: list[Path] = []
+    input_resolved = input_path.resolve()
+    for path in _unique_paths(candidates):
+        if not path.exists() or not path.is_file():
+            continue
+        if path.resolve() == input_resolved:
+            continue
+        filtered.append(path)
+
+    filtered.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in filtered:
+        lowered = path.name.lower()
+        if mono is None and "mono" in lowered:
+            mono = path
+            continue
+        if dual is None and "dual" in lowered:
+            dual = path
+            continue
+
+    # If only one output is found but mode is explicit, map it to requested slot.
+    if mono is None and dual is None and filtered:
+        if mode == "mono":
+            mono = filtered[0]
+        elif mode == "dual":
+            dual = filtered[0]
+
+    return (
+        str(mono) if mono else None,
+        str(dual) if dual else None,
+    )
+
+
+async def process_event_stream(
+    event_stream: Any,
+    *,
+    input_path: Path,
+    output_dir: Path,
+    lang_out: str,
+    mode: str,
+    emit_func: Any = emit,
+    heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+    startup_idle_timeout_seconds: float = STARTUP_IDLE_TIMEOUT_SECONDS,
+    running_idle_timeout_seconds: float = RUNNING_IDLE_TIMEOUT_SECONDS,
+) -> int:
+    loop = asyncio.get_running_loop()
+    last_event_time = loop.time()
+    has_received_event = False
+    has_finish_event = False
+    pending_next = asyncio.create_task(anext(event_stream))
+
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                {pending_next},
+                timeout=heartbeat_interval_seconds,
+            )
+            if not done:
+                idle_seconds = loop.time() - last_event_time
+                idle_timeout = (
+                    running_idle_timeout_seconds
+                    if has_received_event
+                    else startup_idle_timeout_seconds
+                )
+                if idle_seconds >= idle_timeout:
+                    emit_func(build_timeout_error_event(idle_seconds, has_received_event))
+                    return 1
+                emit_func(build_heartbeat_event(idle_seconds, has_received_event))
+                continue
+
+            try:
+                event = pending_next.result()
+            except StopAsyncIteration:
+                break
+
+            has_received_event = True
+            last_event_time = loop.time()
+            serialized = serialize_event(event)
+            if serialized.get("type") == "finish":
+                has_finish_event = True
+            emit_func(serialized)
+            pending_next = asyncio.create_task(anext(event_stream))
+    finally:
+        if pending_next and not pending_next.done():
+            pending_next.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending_next
+        await event_stream.aclose()
+
+    if not has_finish_event:
+        mono_path, dual_path = guess_output_paths(
+            input_path=input_path,
+            output_dir=output_dir,
+            lang_out=lang_out,
+            mode=mode,
+        )
+        if mono_path or dual_path:
+            emit_func(
+                {
+                    "type": "finish",
+                    "synthetic_finish": True,
+                    "translate_result": {
+                        "original_pdf_path": str(input_path),
+                        "mono_pdf_path": mono_path,
+                        "dual_pdf_path": dual_path,
+                        "no_watermark_mono_pdf_path": None,
+                        "no_watermark_dual_pdf_path": None,
+                        "auto_extracted_glossary_path": None,
+                        "total_seconds": None,
+                        "peak_memory_usage": None,
+                    },
+                }
+            )
+            return 0
+
+        emit_func(
+            {
+                "type": "error",
+                "error": "翻译流程异常结束：未收到 finish 事件且未检测到输出文件。",
+                "error_type": "TranslationIncompleteError",
+            }
+        )
+        return 1
+
+    return 0
+
+
 async def run() -> int:
     args = parse_args()
     input_path = Path(args.input).expanduser().resolve()
@@ -398,10 +634,13 @@ async def run() -> int:
         translate_engine_settings=engine_settings,
     )
 
-    async for event in do_translate_async_stream(settings, input_path):
-        emit(serialize_event(event))
-
-    return 0
+    return await process_event_stream(
+        do_translate_async_stream(settings, input_path),
+        input_path=input_path,
+        output_dir=output_dir,
+        lang_out=args.lang_out,
+        mode=args.mode,
+    )
 
 
 async def main() -> int:

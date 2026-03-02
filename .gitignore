@@ -8,9 +8,6 @@ pdf2zh_files/
 *.log
 .env
 src-tauri/gen/
-
-dist/
-.vscode/
-.DS_Store
-src-tauri/target/
-pdf2zh_files/
+__pycache__/
+*.py[cod]
+scripts/__pycache__/
