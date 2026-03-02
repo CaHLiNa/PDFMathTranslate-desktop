@@ -4,12 +4,56 @@ on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
   workflow_dispatch:
 
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  prepare-version:
+    if: github.actor != 'github-actions[bot]'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      ref_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: bump patch version
+        id: bump
+        run: |
+          npm version patch --no-git-tag-version
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          node -e "const fs=require('fs');const path='src-tauri/tauri.conf.json';const data=JSON.parse(fs.readFileSync(path,'utf8'));data.version=process.argv[1];fs.writeFileSync(path, JSON.stringify(data, null, 2) + '\n');" "$NEW_VERSION"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: commit version bump
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json src-tauri/tauri.conf.json
+          if git diff --cached --quiet; then
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "chore: bump version to v${{ steps.bump.outputs.version }} [skip ci]"
+          git push origin HEAD:${GITHUB_REF_NAME}
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   publish:
+    if: needs.prepare-version.result == 'success'
+    needs: prepare-version
     permissions:
       contents: write
     strategy:
@@ -26,6 +70,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-version.outputs.ref_sha }}
 
       - name: setup node
         uses: actions/setup-node@v4
@@ -38,12 +84,6 @@ jobs:
           # 针对不同平台添加对应的 target
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || 'x86_64-pc-windows-msvc' }}
 
-      - name: install dependencies (ubuntu only)
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-
       - name: install frontend dependencies
         run: npm install
 
@@ -51,8 +91,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v__VERSION__ # 这里会自动替换 package.json 中的版本号
-          releaseName: "PDFMathTranslate Desktop v__VERSION__"
+          tagName: v${{ needs.prepare-version.outputs.version }}
+          releaseName: "PDFMathTranslate Desktop v${{ needs.prepare-version.outputs.version }}"
           releaseBody: "自动生成的全平台版本发布。"
           releaseDraft: true
           prerelease: false
