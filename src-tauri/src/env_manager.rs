@@ -1,12 +1,12 @@
-use std::path::{Path, PathBuf};
-use tokio::process::Command;
-use std::process::Stdio;
-use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, BufReader, AsyncWriteExt};
 use futures_util::StreamExt;
-use std::fs;
 use regex::Regex;
+use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
@@ -156,40 +156,37 @@ impl EnvManager {
         }
         fs::create_dir_all(&internal_dir).map_err(|e| e.to_string())?;
 
-        let (url, filename) = if cfg!(target_os = "windows") {
-            ("https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.11.7+20240107-x86_64-pc-windows-msvc-shared-install_runtime.tar.gz", "python.tar.gz")
+        let urls: &[&str] = if cfg!(target_os = "windows") {
+            &[
+                "https://github.com/astral-sh/python-build-standalone/releases/download/20240107/cpython-3.11.7%2B20240107-x86_64-pc-windows-msvc-shared-install_only.tar.gz",
+                "https://github.com/astral-sh/python-build-standalone/releases/download/20240107/cpython-3.11.7%2B20240107-x86_64-pc-windows-msvc-shared-install_runtime.tar.gz",
+                "https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.11.7+20240107-x86_64-pc-windows-msvc-shared-install_runtime.tar.gz",
+            ]
         } else if cfg!(target_os = "macos") {
             if cfg!(target_arch = "aarch64") {
-                ("https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.11.7+20240107-aarch64-apple-darwin-install_runtime.tar.gz", "python.tar.gz")
+                &[
+                    "https://github.com/astral-sh/python-build-standalone/releases/download/20240107/cpython-3.11.7%2B20240107-aarch64-apple-darwin-install_only.tar.gz",
+                    "https://github.com/astral-sh/python-build-standalone/releases/download/20240107/cpython-3.11.7%2B20240107-aarch64-apple-darwin-install_runtime.tar.gz",
+                    "https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.11.7+20240107-aarch64-apple-darwin-install_runtime.tar.gz",
+                ]
             } else {
-                ("https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.11.7+20240107-x86_64-apple-darwin-install_runtime.tar.gz", "python.tar.gz")
+                &[
+                    "https://github.com/astral-sh/python-build-standalone/releases/download/20240107/cpython-3.11.7%2B20240107-x86_64-apple-darwin-install_only.tar.gz",
+                    "https://github.com/astral-sh/python-build-standalone/releases/download/20240107/cpython-3.11.7%2B20240107-x86_64-apple-darwin-install_runtime.tar.gz",
+                    "https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.11.7+20240107-x86_64-apple-darwin-install_runtime.tar.gz",
+                ]
             }
         } else {
             return Err("不支持的操作系统".to_string());
         };
+        let filename = "python.tar.gz";
 
         self.emit_progress(&format!("正在下载 Python 运行时..."), 15);
-        
-        let client = reqwest::Client::new();
-        let response = client.get(url).send().await.map_err(|e| format!("下载失败: {e}"))?;
-        let total_size = response.content_length().unwrap_or(0);
-        
-        let mut downloaded: u64 = 0;
-        let mut stream = response.bytes_stream();
-        let temp_file_path = internal_dir.join(filename);
-        let mut file = tokio::fs::File::create(&temp_file_path).await.map_err(|e| e.to_string())?;
 
-        while let Some(item) = stream.next().await {
-            let chunk = item.map_err(|e| e.to_string())?;
-            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-            downloaded += chunk.len() as u64;
-            
-            if total_size > 0 {
-                let progress = (downloaded as f32 / total_size as f32) * 100.0;
-                self.emit_progress(&format!("正在下载 Python 运行时 ({:.1}%)...", progress), (15.0 + progress * 0.35) as i32);
-            }
-        }
-        file.flush().await.map_err(|e| e.to_string())?;
+        let client = reqwest::Client::new();
+        let temp_file_path = internal_dir.join(filename);
+        self.download_runtime_archive(&client, urls, &temp_file_path)
+            .await?;
 
         self.emit_progress("正在解压 Python...", 55);
         self.extract_tar_gz(&temp_file_path, &internal_dir)?;
@@ -204,6 +201,122 @@ impl EnvManager {
         };
 
         Ok(real_exe)
+    }
+
+    async fn download_runtime_archive(
+        &self,
+        client: &reqwest::Client,
+        urls: &[&str],
+        target_path: &Path,
+    ) -> Result<(), String> {
+        let mut errors: Vec<String> = Vec::new();
+
+        for (idx, url) in urls.iter().enumerate() {
+            self.emit_log(&format!(
+                "尝试下载 Python 运行时 ({}/{})：{}",
+                idx + 1,
+                urls.len(),
+                url
+            ));
+
+            let response = match client.get(*url).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    errors.push(format!("{url} -> 网络错误: {e}"));
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                errors.push(format!("{url} -> HTTP {}", response.status()));
+                continue;
+            }
+
+            let total_size = response.content_length().unwrap_or(0);
+            let mut downloaded: u64 = 0;
+            let mut stream = response.bytes_stream();
+            let mut file = tokio::fs::File::create(target_path)
+                .await
+                .map_err(|e| format!("写入下载文件失败: {e}"))?;
+
+            let mut stream_failed = false;
+            while let Some(item) = stream.next().await {
+                let chunk = match item {
+                    Ok(c) => c,
+                    Err(e) => {
+                        errors.push(format!("{url} -> 下载流错误: {e}"));
+                        stream_failed = true;
+                        break;
+                    }
+                };
+
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| format!("写入下载文件失败: {e}"))?;
+                downloaded += chunk.len() as u64;
+
+                if total_size > 0 {
+                    let progress = (downloaded as f32 / total_size as f32) * 100.0;
+                    self.emit_progress(
+                        &format!("正在下载 Python 运行时 ({:.1}%)...", progress),
+                        (15.0 + progress * 0.35) as i32,
+                    );
+                }
+            }
+
+            file.flush()
+                .await
+                .map_err(|e| format!("刷新下载文件失败: {e}"))?;
+
+            if stream_failed {
+                let _ = fs::remove_file(target_path);
+                continue;
+            }
+
+            match Self::validate_downloaded_archive(target_path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    errors.push(format!("{url} -> {e}"));
+                    let _ = fs::remove_file(target_path);
+                }
+            }
+        }
+
+        Err(format!(
+            "下载 Python 运行时失败，所有镜像均不可用：{}",
+            errors.join(" | ")
+        ))
+    }
+
+    fn validate_downloaded_archive(path: &Path) -> Result<(), String> {
+        let data = fs::read(path).map_err(|e| format!("读取下载文件失败: {e}"))?;
+
+        if data.len() < 1024 {
+            let preview = String::from_utf8_lossy(&data)
+                .replace('\n', " ")
+                .replace('\r', " ");
+            return Err(format!(
+                "下载文件过小({} bytes)，可能是错误页面。内容预览: {}",
+                data.len(),
+                preview
+            ));
+        }
+
+        if !Self::is_gzip_header(&data) {
+            let preview = String::from_utf8_lossy(&data[..data.len().min(64)])
+                .replace('\n', " ")
+                .replace('\r', " ");
+            return Err(format!(
+                "下载文件不是 gzip 压缩包，可能是下载链接失效。文件头预览: {}",
+                preview
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn is_gzip_header(data: &[u8]) -> bool {
+        data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b
     }
 
     fn extract_tar_gz(&self, archive_path: &Path, target_dir: &Path) -> Result<(), String> {
@@ -297,6 +410,17 @@ impl EnvManager {
 
     fn emit_log(&self, line: &str) {
         let _ = self.app_handle.emit("env-setup-log", line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EnvManager;
+
+    #[test]
+    fn detect_gzip_header() {
+        assert!(EnvManager::is_gzip_header(&[0x1f, 0x8b, 0x08]));
+        assert!(!EnvManager::is_gzip_header(b"Not Found"));
     }
 }
 
